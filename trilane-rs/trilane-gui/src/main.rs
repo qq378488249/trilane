@@ -86,6 +86,7 @@ include!("main_config.inc.rs");
 include!("main_agent_loop.inc.rs");
 include!("main_workflow_runtime.inc.rs");
 include!("main_frontend.inc.rs");
+include!("main_headless.inc.rs");
 
 fn main() {
     // Set minimum stack size for all threads to avoid stack overflow in deep codex call chains
@@ -109,6 +110,13 @@ fn main() {
 
     info!("TriLane starting...");
     let startup_resume = startup_resume_request();
+    let headless = match headless_request() {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("trilane headless: {error}");
+            std::process::exit(2);
+        }
+    };
     let state_store = tauri::async_runtime::block_on(TriLaneStateStore::open_default())
         .expect("failed to open TriLane SQLite state store");
     let initial_runbook = tauri::async_runtime::block_on(state_store.load_runbook())
@@ -131,6 +139,24 @@ fn main() {
             transcript_log: Mutex::new(TranscriptArchive::new()),
         })
         .setup(move |app| {
+            if let Some(options) = headless.clone() {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(run_headless(handle, options));
+                return Ok(());
+            }
+            // tauri.conf.json no longer declares windows so headless runs need no display;
+            // the GUI window is created here with the same properties as before.
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("TriLane - Vulnerability Hunter")
+            .inner_size(1400.0, 900.0)
+            .min_inner_size(1000.0, 600.0)
+            .resizable(true)
+            .decorations(false)
+            .build()?;
             if let Some(request) = startup_resume.clone() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
