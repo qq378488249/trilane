@@ -286,6 +286,9 @@ async fn run_script_with_timeout(
     // Handler is kept as guard to control the drop. The `mut` pattern is required because .args()
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
+    // GUI parent must not flash a console window per spawned shell (Windows).
+    #[cfg(windows)]
+    handler.creation_flags(0x08000000); // CREATE_NO_WINDOW
     handler.args(&args[1..]);
     handler.stdin(Stdio::null());
     handler.current_dir(cwd);

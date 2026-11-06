@@ -65,6 +65,10 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     );
 
     let mut cmd = Command::new(&program);
+    // When the parent is a GUI process (TriLane desktop app), each console child
+    // would otherwise flash a new console window. Suppress it on Windows.
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     #[cfg(unix)]
     cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
     cmd.args(args);

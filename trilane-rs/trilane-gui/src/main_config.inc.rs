@@ -273,27 +273,33 @@ fn apply_saved_provider_api_keys() -> Result<(), String> {
 
 /// Write secrets to ~/.trilane/secrets.toml
 fn write_secrets(secrets: &std::collections::HashMap<String, String>) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::fs::PermissionsExt;
-    use std::io::Write;
-
     let path = secrets_path();
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("mkdir failed: {e}"))?;
     let mut doc = String::new();
     for (key, val) in secrets {
         doc.push_str(&format!("{key} = \"{val}\"\n"));
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("Open failed: {e}"))?;
-    file.write_all(doc.as_bytes())
-        .map_err(|e| format!("Write failed: {e}"))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("Permissions failed: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("Open failed: {e}"))?;
+        file.write_all(doc.as_bytes())
+            .map_err(|e| format!("Write failed: {e}"))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Permissions failed: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, doc.as_bytes()).map_err(|e| format!("Write failed: {e}"))?;
+    }
     Ok(())
 }
 
