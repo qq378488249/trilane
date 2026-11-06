@@ -1,0 +1,12 @@
+# CyberGym 任务列表：一行一个 id，# 开头是注释。
+# 支持两种写法，脚本会自动归一：
+#   arvo:1065
+#   n132/arvo:1065
+#   oss-fuzz:370689421
+#   cybergym/oss-fuzz:370689421
+#
+# 这个文件由 compose 挂进编排器容器（deploy/tasks -> /opt/trilane-batch）。
+# 换批次直接改这里，不用重建镜像。
+
+arvo:1065
+arvo:3938

@@ -1,0 +1,97 @@
+# CyberGym 跑批编排器（compose）
+#
+# 全部文件都在 deploy/ 目录，从这里执行：
+#   cd deploy
+#   cp .env.example .env        # 填 CYBERGYM_API_KEY / AGENT_ID / 各路径
+#
+#   # 先干跑（只准备任务包，不启动智能体）
+#   docker compose -f compose.batch.yaml run --rm batch-dry
+#
+#   # 正式跑（后台）
+#   docker compose -f compose.batch.yaml up -d
+#   docker compose -f compose.batch.yaml logs -f
+#
+#   # 停：先停编排器，再清它拉起的智能体（两者是兄弟容器，不会连带停）
+#   docker compose -f compose.batch.yaml down
+#   docker ps --filter name=trilane-cg -q | xargs -r docker stop
+#
+# 设计要点
+# --------
+# * network_mode: host —— 容器内 127.0.0.1 就是宿主，能直接连提交服务端；
+#   compose 默认 bridge 网络下容器看不到宿主 127.0.0.1。用 host 模式后
+#   --server 保持 http://127.0.0.1:8666 即可，不需要 host.docker.internal。
+# * docker.sock —— 编排器要调宿主 daemon 拉起智能体容器。
+# * **所有卷都用同路径挂载**（/X:/X）。容器里发出的 `docker run -v <work>/task`
+#   由宿主 daemon 解析，路径必须两边完全一致，否则智能体挂不到任务目录。
+#   WORK_ROOT 也必须同路径挂，不能用「宿主目录 → 固定容器路径」的映射。
+
+x-batch-common: &batch-common
+  image: ${RUNNER_IMAGE:-trilane-batch-runner:latest}
+  network_mode: host
+  restart: "no"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    # 以下全部同路径挂载（宿主 == 容器）
+    - ${DATA_DIR:-/opt/cybergym_data}:${DATA_DIR:-/opt/cybergym_data}:ro
+    - ${MASK_MAP:-/opt/mask_map.json}:${MASK_MAP:-/opt/mask_map.json}:ro
+    # 任务列表从 deploy/tasks 挂进容器。源用宿主相对路径（相对 deploy/），目标固定。
+    # 目标**不能**是 /opt/trilane-batch：那会把镜像里的脚本整个盖掉。
+    - ${TASKS_DIR:-./tasks}:/tasklist:ro
+    - ${WORK_ROOT:-/var/lib/trilane}:${WORK_ROOT:-/var/lib/trilane}
+    - ${TRILANE_HOME:-/root/.trilane}:/root/.trilane:ro
+  environment:
+    TZ: ${TZ:-Asia/Shanghai}
+    CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
+    CYBERGYM_SERVER: ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
+    CYBERGYM_API_KEY: ${CYBERGYM_API_KEY:?CYBERGYM_API_KEY is required in .env}
+    # 与服务端的 CYBERGYM_SALT / --salt 必须一致
+    CYBERGYM_SALT: ${CYBERGYM_SALT:-CyberGym}
+
+x-batch-args: &batch-args
+  - --task-file
+  - ${TASKS_FILE:-/tasklist/tasks.txt}
+  - --data-dir
+  - ${DATA_DIR:-/opt/cybergym_data}
+  - --mask-map
+  - ${MASK_MAP:-/opt/mask_map.json}
+  # 必须与服务端一致：checksum = sha256(masked_id + agent_id + salt)
+  - --salt
+  - ${CYBERGYM_SALT:-CyberGym}
+  - --server
+  - ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
+  - --agent-id
+  - ${AGENT_ID:-trilane-batch}
+  - --concurrency
+  - "${CONCURRENCY:-1}"
+  - --timeout-sec
+  - "${TASK_TIMEOUT_SEC:-14400}"
+  - --work-root
+  - ${WORK_ROOT:-/var/lib/trilane}/runs/${BATCH_NAME:-batch-1}
+
+services:
+  # 正式跑。容器退出码 0 = 本批有 solved，1 = 没有，3 = preflight 未通过
+  batch:
+    <<: *batch-common
+    container_name: ${CONTAINER_NAME:-trilane-batch}
+    command: *batch-args
+
+  # 干跑：只做 preflight + 任务包准备，不启动智能体
+  batch-dry:
+    <<: *batch-common
+    container_name: ${CONTAINER_NAME:-trilane-batch}-dry
+    command:
+      - --task-file
+      - ${TASKS_FILE:-/tasklist/tasks.txt}
+      - --data-dir
+      - ${DATA_DIR:-/opt/cybergym_data}
+      - --mask-map
+      - ${MASK_MAP:-/opt/mask_map.json}
+      - --salt
+      - ${CYBERGYM_SALT:-CyberGym}
+      - --server
+      - ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
+      - --work-root
+      - ${WORK_ROOT:-/var/lib/trilane}/runs/${BATCH_NAME:-batch-1}
+      - --dry-run
