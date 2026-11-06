@@ -1,0 +1,10 @@
+.git
+trilane-rs/target
+**/node_modules
+assets
+docs
+cybergym-tests
+npm
+*.zip
+*.tgz
+.claude
