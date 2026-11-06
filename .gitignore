@@ -14,6 +14,13 @@ trilane-rs/trilane-gui/frontend/dist/
 npm/*.tar.gz
 npm/vendor/
 
+# 部署用的镜像包（360MB+）与大二进制不进仓库，用目录拷贝传递：
+# deploy/images/ 的 tgz 超过 GitHub 100MB 单文件上限（trilane-headless.tgz 292MB），
+# 推送会被直接拒绝；docker/ 下的是构建缓存产物，构建时按 Dockerfile 注释就地准备。
+deploy/images/
+docker/*.tar.gz
+docker/rusty_v8/
+
 # Logs and caches
 *.log
 .cache/
@@ -34,3 +41,5 @@ __pycache__/
 *~
 .DS_Store
 Thumbs.db
+cybergym-tests/
+logs/
