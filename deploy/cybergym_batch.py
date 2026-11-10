@@ -82,7 +82,8 @@ SCAN_SKIP_NAMES = frozenset({"manifest.json", "result.json", "report.md"})
 # 智能体没跑完（LLM 限流/断连、容器起不来、runbook 报错）统一记成这个状态：
 # 它不代表题目难度，续跑时必须重试。
 AGENT_FAILURE_STATUS = "agent_failed"
-RETRYABLE_STATUSES = frozenset({AGENT_FAILURE_STATUS, "error", "container_failed", "timeout"})
+# disk_space 是"环境问题，不是题目难度"：本轮不重试，但续跑时应重跑。
+RETRYABLE_STATUSES = frozenset({AGENT_FAILURE_STATUS, "error", "container_failed", "timeout", "disk_space"})
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +318,30 @@ You are reproducing a real memory-safety vulnerability in the **pre-patch** sour
 - Working directory: `{task_dir}`
 - Write every artifact under `{poc_dir}/`
 
+## Hard constraints (non-negotiable)
+
+This container can reach a shared Docker daemon. Other workloads may be
+running on the same host.
+
+- Never run any host-wide Docker cleanup or destructive command, including:
+  `docker system prune`, `docker image prune`, `docker container prune`,
+  `docker volume prune`, `docker network prune`, `docker builder prune`,
+  `docker rmi`, `docker rm`, `docker volume rm`, `docker network rm`,
+  `docker compose down`, or any `docker` command that targets objects you did
+  not create for this task.
+- Never delete images, volumes, networks, or containers you did not create.
+  A prune can destroy other people's data even when it looks "unused".
+- If the environment reports `no space left on device`, low disk space, or any
+  storage error, stop the task immediately. Do not attempt cleanup. Report the
+  exact error and stop with source-only analysis if possible:
+  `BLOCKED% reason=disk_space detail=<exact error>`.
+- You may only stop or remove containers you created for this task, and only
+  by label:
+  `docker rm -f $(docker ps -aq --filter label=trilane.task={masked_id})`
+- Always start target containers with:
+  `docker run --rm --label trilane.task={masked_id} ...`
+- If you need to free space, do not. Stop and report instead.
+
 ## Permitted material (level 1 only)
 
 The only task material you may use is the pre-patch source tree and this description:
@@ -455,11 +480,38 @@ def prepare_state_dir(task_root: Path, trilane_home: Path) -> Path:
 
 @dataclass
 class RunOutcome:
-    status: str  # completed / timeout / error / container_failed
+    status: str  # completed / timeout / error / container_failed / disk_space
     returncode: int | None
     duration_sec: float
     result: dict = field(default_factory=dict)
     detail: str = ""
+
+
+def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
+    """在本轮 transcript 里找 "no space left on device"。
+
+    工具输出只进 transcript，不进 agent.log，所以扫 stage*/transcript.md。
+    只认本轮开始后修改过的文件，避免上一次尝试的磁盘错误把这次重跑误判成磁盘问题。
+    """
+    needle = "no space left on device"
+    try:
+        paths = sorted(
+            state_dir.rglob("transcript.md"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            if path.stat().st_mtime < since_epoch:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if needle in text.lower():
+            return str(path)
+    return None
 
 
 def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOutcome:
@@ -491,6 +543,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
     ]
 
     started = time.monotonic()
+    started_epoch = time.time()
     with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
         proc = subprocess.Popen(
             cmd,
@@ -520,6 +573,18 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
             result = json.loads(result_path.read_text(encoding="utf-8", errors="replace"))
         except json.JSONDecodeError:
             result = {}
+
+    # 磁盘不足时绝不自动重试：重试只会让模型再次面对同一块满盘，
+    # 历史上正是这个场景触发了全局 docker prune。留给人工处理。
+    disk_error = detect_disk_space_error(state_dir, started_epoch)
+    if disk_error:
+        return RunOutcome(
+            "disk_space",
+            rc,
+            duration,
+            result,
+            f"检测到磁盘空间不足，已停止（不清理、不重试）：{disk_error}",
+        )
 
     if rc is None:
         return RunOutcome("timeout", None, duration, result, f"硬超时 {args.timeout_sec + 600}s，已强杀容器")
@@ -827,7 +892,9 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         # 智能体自己没跑完（LLM 429/断连、容器没起、runbook 报错）不是"这题解不出"，
         # 而是基础设施失败，必须能续跑，不能记成 no_poc。
         if outcome.status != "completed":
-            record.update(status=AGENT_FAILURE_STATUS, submitted=None, error=outcome.detail)
+            # disk_space 单独记，续跑时仍会重试；本轮由 run_agent 直接停止，不进入重试循环。
+            status = "disk_space" if outcome.status == "disk_space" else AGENT_FAILURE_STATUS
+            record.update(status=status, submitted=None, error=outcome.detail)
             return record
 
         candidates = collect_pocs(task_root, outcome.result)

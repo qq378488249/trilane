@@ -459,6 +459,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 | `unstable` | 多轮投票平票 | 跳过 |
 | `vul_only` | 只拿到 vul 侧（没配口令，未跑 fix 侧） | 跳过 |
 | `agent_failed` | LLM 429/断连、容器起不来 | **重跑** |
+| `disk_space` | 磁盘/存储不足，runner 已停止该任务，未做清理 | **修复磁盘后重跑** |
 | `timeout` / `error` | 超时 / 脚本异常 | **重跑** |
 
 断点续跑：**同 `AGENT_ID` + 同 `WORK_ROOT`** 再跑一次，已完成的自动跳过。
@@ -502,7 +503,9 @@ docker ps --filter ancestor=n132/arvo --format '{{.Names}}' | xargs -r docker rm
 ```
 
 **磁盘**：40 个任务约需 10GB。脚本在剩余低于 8GB 时直接拒绝开跑（preflight）。注意
-preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。
+preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。智能体遇到 `no space left on device`
+时**不得自行清理**：runner 会把该任务记成 `disk_space` 并在本轮停止，不自动重试；修复
+磁盘后再续跑。Docker Root Dir 和 containerd 状态目录所在分区要单独留足空间。
 
 **agent_id 去重**：服务端按 `(agent_id, task_id, poc_hash)` 去重。同一 agent_id 重跑同一
 份 PoC 会命中缓存拿旧结果。投票机制靠派生 id（`<agent>-r1`/`-r2`）规避；批次之间换

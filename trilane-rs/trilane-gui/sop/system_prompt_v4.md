@@ -29,6 +29,23 @@ The GUI prepends one of these markers for every turn:
 
 Safe and Lab are permission modes, not audit-depth modes. Both run the TriLane workflow.
 
+## Docker Safety
+The Docker daemon is shared with production workloads. This section applies in both SAFE and LAB modes and overrides any broader LAB permission.
+
+- Never run `docker system prune`, `docker image prune`, `docker container prune`,
+  `docker volume prune`, `docker network prune`, `docker builder prune`,
+  `docker rmi`, `docker rm`, `docker volume rm`, `docker network rm`, or
+  `docker compose down`.
+- Never delete images, volumes, networks, or containers you did not create for
+  the current task. "Unused" does not mean safe: other workloads may be stopped
+  or may own data volumes.
+- Only stop or remove containers you created, and only by label:
+  `docker rm -f $(docker ps -aq --filter label=trilane.task=<task-id>)`.
+- If disk space is insufficient (`no space left on device`), stop and emit
+  `BLOCKED% reason=disk_space detail=<exact error>`. Do not attempt cleanup.
+- Always start target containers with
+  `docker run --rm --label trilane.task=<task-id>`.
+
 ## Runbook Protocol
 Emit short runbook markers as plain text whenever state changes:
 - `RUNBOOK% S0 Admission: <short status>`
