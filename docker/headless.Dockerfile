@@ -55,6 +55,9 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
 COPY --from=docker.1ms.run/library/docker:cli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY --from=builder /usr/local/bin/trilane-gui /usr/local/bin/trilane-gui
+# system_prompt_v4.md 是运行时按编译期 CARGO_MANIFEST_DIR 路径读取的
+# （main_commands.inc.rs），路径必须与构建时源码布局一致；缺失会静默退化成兜底短语。
+COPY trilane-rs/trilane-gui/sop/ /src/trilane-rs/trilane-gui/sop/
 # headless 模式下 tauri 仍会初始化 GTK 后端，容器内没有显示器会 panic
 # （tao event_loop.rs:217 "Failed to initialize gtk backend!"），需要虚拟显示。
 # xauth 必须一起装：xvfb-run 在缺少它时直接报 "xauth command not found"。

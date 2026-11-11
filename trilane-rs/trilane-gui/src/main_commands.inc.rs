@@ -68,10 +68,27 @@ async fn start_agent(
 
     let state_db = codex_core::init_state_db(&config).await;
 
-    let sop_prompt = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sop/system_prompt_v4.md"),
-    )
-    .unwrap_or_else(|_| "You are TriLane, a lane-orchestrated security audit agent.".to_string());
+    // SOP 读不到时会静默退化成一句兜底提示，跑批时无法判断到底用了哪份。
+    // 这里把路径和字节数打出来，日志里就能确认内置 SOP 是否生效。
+    let sop_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sop/system_prompt_v4.md");
+    let sop_prompt = match std::fs::read_to_string(&sop_path) {
+        Ok(text) => {
+            info!(
+                "SOP loaded: {} bytes, {} lines from {}",
+                text.len(),
+                text.lines().count(),
+                sop_path.display()
+            );
+            text
+        }
+        Err(error) => {
+            warn!(
+                "SOP not loaded ({error}), falling back to built-in stub: {}",
+                sop_path.display()
+            );
+            "You are TriLane, a lane-orchestrated security audit agent.".to_string()
+        }
+    };
 
     let arg0_paths = state.arg0_paths.clone();
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
