@@ -16,6 +16,10 @@
 # ---------- builder ----------
 FROM docker.1ms.run/library/rust:1.95-bookworm AS builder
 ENV DEBIAN_FRONTEND=noninteractive
+# trilane-rs/rust-toolchain.toml 声明了 clippy/rustfmt/rust-src，基础镜像只装了
+# cargo/rustc/rust-std；不指定 RUSTUP_TOOLCHAIN 时 rustup 会去 static.rust-lang.org
+# 同步 channel 补组件，容器内无外网就构建失败。构建不需要这些组件，直接绕过。
+ENV RUSTUP_TOOLCHAIN=1.95.0
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
  && apt-get update && apt-get install -y --no-install-recommends \
       libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
