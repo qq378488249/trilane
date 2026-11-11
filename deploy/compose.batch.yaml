@@ -27,7 +27,7 @@
 #   WORK_ROOT 也必须同路径挂，不能用「宿主目录 → 固定容器路径」的映射。
 
 x-batch-common: &batch-common
-  image: ${RUNNER_IMAGE:-trilane-batch-runner:latest}
+  image: ${RUNNER_IMAGE:-trilane-batch-runner:1.0.1}
   network_mode: host
   restart: "no"
   extra_hosts:
