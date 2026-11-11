@@ -24,10 +24,11 @@
 
 两个容易踩的坑（本机实测）
 --------------------------
-1. **同路径挂载**：智能体容器内通过挂载的 docker.sock 自己起 vul 镜像。它看到的路径
-   必须同时也是 docker daemon 看到的路径，否则 `docker run -v <poc>:/tmp/poc` 解析不到。
-   所以宿主 `D:\\...` 统一换算成 `/host_mnt/d/...`，并把它**原样**挂进智能体容器
-   （`-v /host_mnt/d/x:/host_mnt/d/x`），提示词里给出的也是这个路径。
+1. **同路径挂载**：默认 `--isolation dind`，智能体在每任务独立的 dind 里起 vul 镜像。
+   智能体看到的路径必须同时也是 dind daemon 看到的路径，否则 `docker run -v
+   <poc>:/tmp/poc` 解析不到。所以 task/out 目录会同时挂进 dind 容器和智能体容器；
+   宿主 `D:\\...` 统一换算成 `/host_mnt/d/...`。`--isolation host` 保留旧行为（直连
+   宿主 daemon），仅作逃生/兼容。
 2. **每个任务独立的 state 目录**：多个容器共用一个 `/root/.trilane` 会抢同一个 SQLite
    state store，表现为容器还活着但 trilane-gui 进程消失、out 目录不写产物。
 """
@@ -84,6 +85,10 @@ SCAN_SKIP_NAMES = frozenset({"manifest.json", "result.json", "report.md"})
 AGENT_FAILURE_STATUS = "agent_failed"
 # disk_space 是"环境问题，不是题目难度"：本轮不重试，但续跑时应重跑。
 RETRYABLE_STATUSES = frozenset({AGENT_FAILURE_STATUS, "error", "container_failed", "timeout", "disk_space"})
+
+# DinD 里给智能体用的 docker socket。dind 容器和智能体容器通过同一个 volume
+# 共享这个目录；不要用 /var/run，避免覆盖智能体容器自己的运行时文件。
+DIND_SOCKET_DIR = "/run/trilane-dind"
 
 # TASK.md / prompt 里本身就有 "no space left on device" 这句话，不能只按短语匹配；
 # 只认 Docker 或文件系统真实报错行，避免任务一进 S0 就被误判成 disk_space。
@@ -527,6 +532,13 @@ class RunOutcome:
     detail: str = ""
 
 
+@dataclass
+class DindHandle:
+    name: str
+    data_volume: str
+    run_volume: str
+
+
 def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
     """在本轮 transcript 里找 "no space left on device"。
 
@@ -554,6 +566,122 @@ def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
     return None
 
 
+def start_dind(task: TaskRef, task_root: Path, args: argparse.Namespace) -> DindHandle:
+    """为一个任务尝试启动独立的 docker:dind。
+
+    dind 需要 privileged；/var/lib/docker 和 socket 都用 Docker named volume，
+    任务结束（或失败）时由 stop_dind 一起删掉，避免依赖宿主目录权限/挂载实现。
+    """
+    suffix = uuid.uuid4().hex[:8]
+    name = f"trilane-dind-{task.slug}-{uuid.uuid4().hex[:6]}"
+    data_volume = f"trilane-dind-{task.slug}-{suffix}-data"
+    run_volume = f"trilane-dind-{task.slug}-{suffix}-run"
+    d_task = daemon_path(task_root / "task")
+    d_out = daemon_path(task_root / "out")
+
+    created: list[str] = []
+    try:
+        for volume in (data_volume, run_volume):
+            proc = run([
+                "docker", "volume", "create",
+                "--label", "trilane.role=dind",
+                "--label", f"trilane.task={task.slug}",
+                "--label", f"trilane.batch={args.agent_id}",
+                volume,
+            ], timeout=30)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout).strip()[-500:]
+                raise RuntimeError(f"docker volume create {volume} 失败：{detail}")
+            created.append(volume)
+
+        cmd = [
+            "docker", "run", "-d", "--name", name,
+            "--privileged",
+            "--label", "trilane.role=dind",
+            "--label", f"trilane.task={task.slug}",
+            "--label", f"trilane.batch={args.agent_id}",
+            "-e", "DOCKER_TLS_CERTDIR=",
+            "-e", f"DOCKER_HOST=unix://{DIND_SOCKET_DIR}/docker.sock",
+            "-v", f"{data_volume}:/var/lib/docker",
+            "-v", f"{run_volume}:{DIND_SOCKET_DIR}",
+            # 目标容器要 bind mount 任务目录；dind 的 daemon 必须也能看到同一路径。
+            "-v", f"{d_task}:{d_task}",
+            "-v", f"{d_out}:{d_out}",
+            args.dind_image,
+            f"--host=unix://{DIND_SOCKET_DIR}/docker.sock",
+            "--iptables=false",
+            "--bridge=none",
+        ]
+        proc = run(cmd, timeout=120)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[-800:]
+            raise RuntimeError(f"docker run {args.dind_image} 失败：{detail}")
+    except Exception:
+        for volume in reversed(created):
+            run(["docker", "volume", "rm", "-f", volume], timeout=60)
+        raise
+
+    return DindHandle(name=name, data_volume=data_volume, run_volume=run_volume)
+
+
+def wait_dind(handle: DindHandle, timeout: float = 120) -> bool:
+    """等 dind 里的 dockerd 真正可用。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = run(["docker", "inspect", "-f", "{{.State.Running}}", handle.name], timeout=10)
+        if state.returncode != 0 or state.stdout.strip() != "true":
+            return False
+        info = run(["docker", "exec", handle.name, "docker", "info"], timeout=20)
+        if info.returncode == 0:
+            return True
+        time.sleep(2)
+    return False
+
+
+def load_image_into_dind(handle: DindHandle, image: str, timeout: float = 1800) -> None:
+    """把宿主上的目标镜像灌进 dind，不经过网络。"""
+    env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
+    save = subprocess.Popen(
+        ["docker", "save", image],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if save.stdout is None:
+        raise RuntimeError("docker save 没有 stdout")
+    load = subprocess.Popen(
+        ["docker", "exec", "-i", handle.name, "docker", "load"],
+        stdin=save.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    # 父进程不再需要写端；load 直接消费 save 的输出。
+    save.stdout.close()
+    try:
+        _, load_err = load.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for proc in (load, save):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        raise RuntimeError(f"导入镜像超时（{timeout}s）：{image}")
+    save.wait()
+    save_err = save.stderr.read() if save.stderr is not None else b""
+    if load.returncode != 0:
+        detail = (load_err or b"").decode(errors="replace")[-500:]
+        raise RuntimeError(f"docker load {image} 失败：{detail}")
+    if save.returncode != 0:
+        detail = (save_err or b"").decode(errors="replace")[-500:]
+        raise RuntimeError(f"docker save {image} 失败：{detail}")
+
+
+def stop_dind(handle: DindHandle) -> None:
+    run(["docker", "rm", "-f", handle.name], timeout=180)
+    for volume in (handle.data_volume, handle.run_volume):
+        run(["docker", "volume", "rm", "-f", volume], timeout=60)
+
+
 def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOutcome:
     task_dir = task_root / "task"
     out_dir = task_root / "out"
@@ -565,73 +693,118 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
     d_out = daemon_path(out_dir)
     d_state = daemon_path(state_dir)
 
-    cmd = [
-        "docker", "run", "--rm", "--name", container,
-        "-v", "/var/run/docker.sock:/var/run/docker.sock",
-        # 同路径挂载：容器内看到的路径 == daemon 解析的路径
-        "-v", f"{d_task}:{d_task}",
-        "-v", f"{d_out}:{d_out}",
-        "-v", f"{d_state}:/root/.trilane",
-        "-e", "HOME=/root",
-        args.agent_image,
-        "--headless",
-        "--objective-file", f"{d_task}/TASK.md",
-        "--out-dir", d_out,
-        "--cwd", d_task,
-        "--audit-mode", args.audit_mode,
-        "--headless-timeout-sec", str(args.timeout_sec),
-    ]
-
     started = time.monotonic()
     started_epoch = time.time()
-    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
-        )
-        try:
-            # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
-            proc.wait(timeout=args.timeout_sec + 600)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            run(["docker", "rm", "-f", container])
+    dind: DindHandle | None = None
+    try:
+        if args.isolation == "dind":
             try:
-                proc.wait(timeout=120)
+                log(f"[{task.task_id}] 启动 DinD（目标镜像 {task.vul_image}）")
+                dind = start_dind(task, task_root, args)
+                if not wait_dind(dind):
+                    return RunOutcome(
+                        "container_failed",
+                        None,
+                        time.monotonic() - started,
+                        {},
+                        "DinD 启动后未就绪",
+                    )
+                log(f"[{task.task_id}] 导入目标镜像到 DinD ...")
+                load_image_into_dind(dind, task.vul_image)
+                log(f"[{task.task_id}] DinD 就绪")
+            except Exception as exc:
+                return RunOutcome(
+                    "container_failed",
+                    None,
+                    time.monotonic() - started,
+                    {},
+                    f"DinD 初始化失败：{exc}",
+                )
+
+        cmd = [
+            "docker", "run", "--rm", "--name", container,
+            "--label", "trilane.role=agent",
+            "--label", f"trilane.task={task.slug}",
+            "--label", f"trilane.batch={args.agent_id}",
+        ]
+        if args.isolation == "dind":
+            assert dind is not None
+            cmd += [
+                "-v", f"{dind.run_volume}:{DIND_SOCKET_DIR}",
+                "-e", f"DOCKER_HOST=unix://{DIND_SOCKET_DIR}/docker.sock",
+            ]
+        else:
+            # 旧路径：智能体直接连宿主 daemon，只保留作逃生/兼容。
+            cmd += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+        cmd += [
+            # 同路径挂载：容器内看到的路径 == daemon 解析的路径
+            "-v", f"{d_task}:{d_task}",
+            "-v", f"{d_out}:{d_out}",
+            "-v", f"{d_state}:/root/.trilane",
+            "-e", "HOME=/root",
+        ]
+        cmd += [
+            args.agent_image,
+            "--headless",
+            "--objective-file", f"{d_task}/TASK.md",
+            "--out-dir", d_out,
+            "--cwd", d_task,
+            "--audit-mode", args.audit_mode,
+            "--headless-timeout-sec", str(args.timeout_sec),
+        ]
+
+        with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
+            )
+            try:
+                # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
+                proc.wait(timeout=args.timeout_sec + 600)
+                rc = proc.returncode
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=60)
-            rc = None
-    duration = time.monotonic() - started
+                run(["docker", "rm", "-f", container])
+                try:
+                    proc.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=60)
+                rc = None
+        duration = time.monotonic() - started
 
-    result_path = out_dir / "result.json"
-    result: dict = {}
-    if result_path.exists():
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            result = {}
+        result_path = out_dir / "result.json"
+        result: dict = {}
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                result = {}
 
-    # 磁盘不足时绝不自动重试：重试只会让模型再次面对同一块满盘，
-    # 历史上正是这个场景触发了全局 docker prune。留给人工处理。
-    disk_error = detect_disk_space_error(state_dir, started_epoch)
-    if disk_error:
-        return RunOutcome(
-            "disk_space",
-            rc,
-            duration,
-            result,
-            f"检测到磁盘空间不足，已停止（不清理、不重试）：{disk_error}",
-        )
+        # 磁盘不足时绝不自动重试：重试只会让模型再次面对同一块满盘，
+        # 历史上正是这个场景触发了全局 docker prune。留给人工处理。
+        disk_error = detect_disk_space_error(state_dir, started_epoch)
+        if disk_error:
+            return RunOutcome(
+                "disk_space",
+                rc,
+                duration,
+                result,
+                f"检测到磁盘空间不足，已停止（不清理、不重试）：{disk_error}",
+            )
 
-    if rc is None:
-        return RunOutcome("timeout", None, duration, result, f"硬超时 {args.timeout_sec + 600}s，已强杀容器")
-    status = str(result.get("status") or "")
-    if not status:
-        return RunOutcome("container_failed", rc, duration, result, f"没有 result.json（退出码 {rc}），见 agent.log")
-    return RunOutcome(status, rc, duration, result, str(result.get("error") or ""))
+        if rc is None:
+            return RunOutcome("timeout", None, duration, result, f"硬超时 {args.timeout_sec + 600}s，已强杀容器")
+        status = str(result.get("status") or "")
+        if not status:
+            return RunOutcome("container_failed", rc, duration, result, f"没有 result.json（退出码 {rc}），见 agent.log")
+        return RunOutcome(status, rc, duration, result, str(result.get("error") or ""))
+    finally:
+        if dind is not None:
+            log(f"[{task.task_id}] 清理 DinD {dind.name}")
+            stop_dind(dind)
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,6 +1228,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--audit-mode", choices=("lab", "safe"), default="lab", help="TriLane 审计模式")
     parser.add_argument("--agent-image", default="trilane-headless:latest", help="智能体镜像")
+    parser.add_argument(
+        "--isolation",
+        choices=("dind", "host"),
+        default=os.environ.get("TRILANE_ISOLATION", "dind"),
+        help="智能体 Docker 隔离：dind（默认，每任务独立 daemon）或 host（旧行为，直连宿主 daemon）",
+    )
+    parser.add_argument(
+        "--dind-image",
+        default=os.environ.get("TRILANE_DIND_IMAGE", "docker:dind"),
+        help="DinD 镜像（--isolation dind 时使用）",
+    )
     parser.add_argument("--vul-image", default=None, help="覆盖 vul 镜像名（调试用）")
     parser.add_argument("--work-root", default=None, help="工作目录根；默认 runs/cybergym-<时间戳>")
     parser.add_argument("--trilane-home", default=str(Path.home() / ".trilane"), help="宿主 ~/.trilane，用于拷 config/secrets")
