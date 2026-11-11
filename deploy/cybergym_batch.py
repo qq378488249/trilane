@@ -780,10 +780,15 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                         {},
                         "DinD 启动后未就绪",
                     )
-                log(f"[{task.task_id}] 导入目标镜像到 DinD ...")
-                load_image_into_dind(dind, task.vul_image)
-                log(f"[{task.task_id}] 导入智能体镜像到 DinD ...")
-                load_image_into_dind(dind, args.agent_image)
+                # 每个镜像单独计时：导入是大头开销，日志里要能看出各自花了多久，
+                # 否则只能从下一条消息的时间戳倒推。
+                for label, image in (("目标镜像", task.vul_image), ("智能体镜像", args.agent_image)):
+                    log(f"[{task.task_id}] 导入{label}到 DinD（{image}）...")
+                    stage_started = time.monotonic()
+                    load_image_into_dind(dind, image)
+                    log(
+                        f"[{task.task_id}] {label}导入完成（{time.monotonic() - stage_started:.0f}s）"
+                    )
                 log(f"[{task.task_id}] DinD 就绪")
             except Exception as exc:
                 return RunOutcome(
