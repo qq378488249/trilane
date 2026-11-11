@@ -20,9 +20,9 @@
 # * network_mode: host —— 容器内 127.0.0.1 就是宿主，能直接连提交服务端；
 #   compose 默认 bridge 网络下容器看不到宿主 127.0.0.1。用 host 模式后
 #   --server 保持 http://127.0.0.1:8666 即可，不需要 host.docker.internal。
-# * docker.sock —— 编排器要调宿主 daemon 拉起智能体容器。
-# * **所有卷都用同路径挂载**（/X:/X）。容器里发出的 `docker run -v <work>/task`
-#   由宿主 daemon 解析，路径必须两边完全一致，否则智能体挂不到任务目录。
+# * docker.sock —— 编排器要调宿主 daemon 拉起智能体容器和每任务独立的 dind。
+# * **所有卷都用同路径挂载**（/X:/X）。智能体在 dind 里发出的 `docker run -v <work>/task`
+#   由 dind daemon 解析，所以 task/out 也要同路径挂进 dind 容器。
 #   WORK_ROOT 也必须同路径挂，不能用「宿主目录 → 固定容器路径」的映射。
 
 x-batch-common: &batch-common
@@ -63,10 +63,20 @@ x-batch-args: &batch-args
   - ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
   - --agent-id
   - ${AGENT_ID:-trilane-batch}
+  - --isolation
+  - ${ISOLATION:-dind}
+  - --dind-image
+  - ${DIND_IMAGE:-docker:dind}
   - --concurrency
   - "${CONCURRENCY:-1}"
   - --timeout-sec
   - "${TASK_TIMEOUT_SEC:-14400}"
+  - --agent-retries
+  - "${AGENT_RETRIES:-1}"
+  - --max-submits
+  - "${MAX_SUBMITS:-3}"
+  - --verify-rounds
+  - "${VERIFY_ROUNDS:-3}"
   - --work-root
   - ${WORK_ROOT:-/var/lib/trilane}/runs/${BATCH_NAME:-batch-1}
 
@@ -94,4 +104,8 @@ services:
       - ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
       - --work-root
       - ${WORK_ROOT:-/var/lib/trilane}/runs/${BATCH_NAME:-batch-1}
+      - --isolation
+      - ${ISOLATION:-dind}
+      - --dind-image
+      - ${DIND_IMAGE:-docker:dind}
       - --dry-run

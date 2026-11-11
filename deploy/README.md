@@ -5,10 +5,10 @@
 ```
 宿主 docker daemon
  ├─ trilane-batch-runner    ← 编排器：python + 跑批脚本，不跑智能体
- │    └─ 通过 docker.sock 拉起 ↓
- ├─ trilane-headless        ← 智能体本体（每个任务一个容器）
- │    └─ 通过 docker.sock 再拉起 ↓
- └─ n132/arvo:<id>-vul      ← 目标程序，跑 PoC
+ │    ├─ 通过 docker.sock 拉起 ↓
+ │    ├─ trilane-headless        ← 智能体本体（每个任务一个容器）
+ │    └─ trilane-dind-<task>     ← 每任务独立的 DinD daemon（--privileged）
+ │         └─ n132/arvo:<id>-vul ← 智能体在 dind 里起的目标容器
 ```
 
 服务器上**不需要 Python、不需要构建工具链**，只要 Docker。
@@ -45,6 +45,7 @@
 | Docker | 20.10+，能 `docker run`。**daemon 必须与服务端同一台**（服务端要靠它起目标容器） |
 | 磁盘 | 两个镜像 ~1GB；数据集 4GB；每任务解包 ~0.25GB；目标镜像每个 0.5–2GB |
 | 内存 | 8GB 起。每个目标容器上限 4GB，**并发 N 就要 N×4GB** |
+| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 2–4GB 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，落在 Docker Root Dir） |
 
 ---
 
@@ -60,6 +61,14 @@ for f in images/*.tgz; do gunzip -c "$f" | docker load; done
 ```
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
+
+DinD 模式（默认 `--isolation dind`）还需要 `docker:dind` 镜像：
+
+```bash
+docker pull docker:dind
+# 或从打包机带过来：
+# docker save docker:dind | gzip > docker-dind.tgz
+```
 
 ### 打包机（缺的包在这里生成）
 
@@ -282,6 +291,16 @@ arvo:3938
 支持 `n132/arvo:1065`、`cybergym/oss-fuzz:370689421` 这类镜像名写法，脚本会自动归一成
 `arvo:1065` / `oss-fuzz:370689421`。
 
+两族的运行方式不同，`TASK.md` 会按族生成不同示例：
+
+| 族 | 镜像 | 必须追加 | 说明 |
+| --- | --- | --- | --- |
+| arvo | `n132/arvo:<id>-vul` | `/bin/arvo` | 镜像没有 entrypoint，默认 cmd 是 `sleep infinity`；不加会一直挂着 |
+| oss-fuzz | `cybergym/oss-fuzz:<id>-vul` | 不追加 | 默认 cmd 是 `run_poc`，自动读 `/tmp/poc`；追加 `/bin/arvo` 会 127 |
+
+oss-fuzz 数据集里 139 个任务目前只有少数带 `repo-vul.tar.gz`，其余只有 `description.txt`
+和 `error.txt`，`discover_tasks` 会把它们记为缺料并跳过。
+
 `.env` 里要看的几项：
 
 ```ini
@@ -319,8 +338,9 @@ docker compose -f compose.batch.yaml logs -f
 
 ```bash
 docker compose -f compose.batch.yaml down
-# 智能体是兄弟容器，compose down 不会连带停掉
+# 智能体和 dind 都是兄弟容器，compose down 不会连带停掉
 docker ps --filter name=trilane-cg -q | xargs -r docker stop
+docker ps --filter name=trilane-dind -q | xargs -r docker rm -f
 ```
 
 `compose.batch.yaml` 里有两条关键设置：
@@ -405,6 +425,8 @@ runner 起的智能体容器是**兄弟容器**（sibling），不是子进程�
 | `--api-key` | `$CYBERGYM_API_KEY` | 只用于 fix 侧判定 |
 | `--salt` | `CyberGym` | **必须与服务端一致**，否则 400 Invalid checksum |
 | `--agent-id` | 按批次生成 | **上传归账用**，同批用同一个 |
+| `--isolation` | `dind` | `dind` = 每任务独立 daemon；`host` = 旧行为，直连宿主 daemon |
+| `--dind-image` | `docker:dind` | DinD 镜像 |
 | `--concurrency` | 2 | 并发任务数；内存受限，建议 1–2 |
 | `--timeout-sec` | 14400 | 单任务超时（4 小时） |
 | `--agent-retries` | 1 | 智能体因 OOM/启动失败中断时批内自动重试次数 |
@@ -446,6 +468,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
     task/{TASK.md, description.txt, src/, poc/}   # 智能体工作区
     out/{result.json, report.md}                  # TriLane 产物
     state/trilane/                                # 该任务独占的 ~/.trilane
+    # dind 的 /var/lib/docker 和 socket 用 Docker named volume（trilane-dind-*），任务结束删除
     agent.log                                     # 容器 stdout/stderr
 ```
 
@@ -502,6 +525,16 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 docker ps --filter ancestor=n132/arvo --format '{{.Names}}' | xargs -r docker rm -f
 ```
 
+**DinD**：默认 `--isolation dind`。每个任务创建独立的 `docker:dind`（数据卷在 Docker Root
+Dir），需要宿主允许 `--privileged`。目标镜像必须先存在宿主，runner 会 `docker save | docker exec
+... docker load` 灌进 dind；dind 容器自身保留默认网络，但内层目标容器按提示词使用
+`--network none`，不依赖 dind 拉取镜像。任务结束/超时 runner 会删除 dind 及其 named
+volume；runner 崩溃可能残留，可手动清：
+
+```bash
+docker ps -aq --filter label=trilane.role=dind | xargs -r docker rm -f
+```
+
 **磁盘**：40 个任务约需 10GB。脚本在剩余低于 8GB 时直接拒绝开跑（preflight）。注意
 preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。智能体遇到 `no space left on device`
 时**不得自行清理**：runner 会把该任务记成 `disk_space` 并在本轮停止，不自动重试；修复
@@ -525,6 +558,7 @@ preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。智能体遇到 `n
 | `deploy/` 整个目录 | 脚本 + 编排 + 文档 |
 | `trilane-batch-runner` 镜像 | 或到新机器上用 `deploy/` 重建 |
 | `trilane-headless` 镜像 | 智能体本体 |
+| `docker:dind` 镜像 | 默认 DinD 隔离模式需要；也可在服务器上 `docker pull` |
 | 各任务的 `<id>-vul` 镜像 | 目标程序 |
 | `cybergym_data` | 数据集（只用到 level1 两件） |
 | `mask_map.json` | 与服务端同一份 |
