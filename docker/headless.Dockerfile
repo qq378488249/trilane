@@ -30,7 +30,7 @@ COPY trilane-rs/trilane-gui/frontend/dist/ trilane-rs/trilane-gui/frontend/dist/
 # 预置 rusty_v8 静态库，避免构建时访问 GitHub
 COPY docker/rusty_v8/ /usr/local/cargo/.rusty_v8/
 
-ENV CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=2
 WORKDIR /src/trilane-rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/trilane-rs/target \
@@ -47,7 +47,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
       xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
-# 通过挂载的 docker.sock 在宿主上运行 vul/fix 镜像
+# docker CLI：默认连每任务 DinD 的 socket（--isolation host 时才连宿主 daemon）
 COPY --from=docker.1ms.run/library/docker:cli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY --from=builder /usr/local/bin/trilane-gui /usr/local/bin/trilane-gui

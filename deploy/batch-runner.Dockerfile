@@ -3,8 +3,9 @@
 # 分工：
 #   本镜像（trilane-batch-runner）= python + requests + docker CLI + cybergym_batch.py
 #     └─ 通过挂载的 docker.sock 调宿主 daemon
-#          └─ trilane-headless 容器（每个任务一个，镜像另行导入）
-#               └─ 也通过 docker.sock 再起 n132/arvo:<id>-vul 跑 PoC
+#          ├─ trilane-dind-<task>（每任务一个，默认隔离）
+#          │    └─ 智能体在 dind 里起 n132/arvo:<id>-vul 跑 PoC
+#          └─ trilane-headless 容器（每个任务一个）
 #
 # 构建（在 deploy/ 目录执行；构建上下文只有本目录，镜像很小）：
 #   cd deploy

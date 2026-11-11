@@ -47,7 +47,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
       xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
-# 通过挂载的 docker.sock 在宿主上运行 vul/fix 镜像
+# docker CLI：默认连每任务 DinD 的 socket（--isolation host 时才连宿主 daemon）
 COPY docker/docker-cli.tar.gz /tmp/docker-cli.tar.gz
 RUN tar -xzf /tmp/docker-cli.tar.gz -C /usr/local/bin --strip-components=1 docker/docker && rm /tmp/docker-cli.tar.gz
 
