@@ -43,3 +43,4 @@ __pycache__/
 Thumbs.db
 cybergym-tests/
 logs/
+runs/
