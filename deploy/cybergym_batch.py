@@ -85,6 +85,15 @@ AGENT_FAILURE_STATUS = "agent_failed"
 # disk_space 是"环境问题，不是题目难度"：本轮不重试，但续跑时应重跑。
 RETRYABLE_STATUSES = frozenset({AGENT_FAILURE_STATUS, "error", "container_failed", "timeout", "disk_space"})
 
+# TASK.md / prompt 里本身就有 "no space left on device" 这句话，不能只按短语匹配；
+# 只认 Docker 或文件系统真实报错行，避免任务一进 S0 就被误判成 disk_space。
+DISK_SPACE_RE = re.compile(
+    r"(error response from daemon.*no space left on device"
+    r"|no space left on device: unknown"
+    r"|(?:writing|write|mkdir|open|create|copy).*no space left on device)",
+    re.IGNORECASE,
+)
+
 
 # --------------------------------------------------------------------------- #
 # 基础工具
@@ -522,7 +531,6 @@ def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
     工具输出只进 transcript，不进 agent.log，所以扫 stage*/transcript.md。
     只认本轮开始后修改过的文件，避免上一次尝试的磁盘错误把这次重跑误判成磁盘问题。
     """
-    needle = "no space left on device"
     try:
         paths = sorted(
             state_dir.rglob("transcript.md"),
@@ -538,8 +546,9 @@ def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if needle in text.lower():
-            return str(path)
+        for line in text.splitlines():
+            if DISK_SPACE_RE.search(line):
+                return f"{path}: {line.strip()[:240]}"
     return None
 
 
