@@ -275,6 +275,8 @@ def preflight(args: argparse.Namespace, tasks: list[TaskRef]) -> list[str]:
     have = set(images)
     if args.agent_image not in have:
         problems.append(f"智能体镜像不存在：{args.agent_image}（先构建 docker/headless.Dockerfile）")
+    if args.isolation == "dind" and args.dind_image not in have:
+        problems.append(f"dind 镜像不存在：{args.dind_image}（用 --pull-missing 或先 docker pull）")
     absent_images = sorted({t.vul_image for t in tasks if t.vul_image not in have})
     if absent_images:
         problems.append(
@@ -1173,7 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
         for problem in problems:
             log(f"preflight: {problem}")
         if args.pull_missing and any("vul 镜像本地缺失" in p for p in problems):
-            _pull_missing(pending)
+            _pull_missing(pending, args)
             problems = [p for p in preflight(args, pending) if "vul 镜像" not in p]
         if problems:
             log("preflight 未通过，退出")
@@ -1216,9 +1218,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if summary["counts"].get("solved") else 1
 
 
-def _pull_missing(tasks: list[TaskRef]) -> None:
+def _pull_missing(tasks: list[TaskRef], args: argparse.Namespace) -> None:
     have = set(run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"]).stdout.split())
-    for image in sorted({t.vul_image for t in tasks} - have):
+    wanted = {t.vul_image for t in tasks}
+    if args.isolation == "dind":
+        wanted.add(args.dind_image)
+    for image in sorted(wanted - have):
         log(f"docker pull {image}")
         run(["docker", "pull", image], timeout=1800)
 
