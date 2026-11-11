@@ -44,3 +44,4 @@ Thumbs.db
 cybergym-tests/
 logs/
 runs/
+deploy/dind/

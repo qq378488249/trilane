@@ -34,7 +34,7 @@ COPY trilane-rs/trilane-gui/frontend/dist/ trilane-rs/trilane-gui/frontend/dist/
 # 预置 rusty_v8 静态库，避免构建时访问 GitHub
 COPY docker/rusty_v8/ /usr/local/cargo/.rusty_v8/
 
-ENV CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=1
 WORKDIR /src/trilane-rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/trilane-rs/target \
