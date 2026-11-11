@@ -4,12 +4,16 @@
 
 ```
 宿主 docker daemon
- ├─ trilane-batch-runner    ← 编排器：python + 跑批脚本，不跑智能体
- │    ├─ 通过 docker.sock 拉起 ↓
- │    ├─ trilane-headless        ← 智能体本体（每个任务一个容器）
- │    └─ trilane-dind-<task>     ← 每任务独立的 DinD daemon（--privileged）
- │         └─ n132/arvo:<id>-vul ← 智能体在 dind 里起的目标容器
+ └─ trilane-batch-runner    ← 编排器：python + 跑批脚本，不跑智能体
+      │  通过 docker.sock 拉起 ↓
+      └─ trilane-dind-<task>     ← 每任务独立的 DinD daemon（--privileged）
+           ├─ trilane-headless   ← 智能体本体，跑在 dind 内部
+           └─ n132/arvo:<id>-vul ← 智能体在同一个 dind 里起的目标容器
 ```
+
+智能体容器由 dind 自己创建（`docker exec <dind> docker run ...`），所以它只能看到这个
+私有 daemon：宿主上的其他容器、镜像、卷对它完全不可见，`docker system prune` 之类的
+命令也只作用于本任务的 dind。
 
 服务器上**不需要 Python、不需要构建工具链**，只要 Docker。
 
@@ -45,7 +49,7 @@
 | Docker | 20.10+，能 `docker run`。**daemon 必须与服务端同一台**（服务端要靠它起目标容器） |
 | 磁盘 | 两个镜像 ~1GB；数据集 4GB；每任务解包 ~0.25GB；目标镜像每个 0.5–2GB |
 | 内存 | 8GB 起。每个目标容器上限 4GB，**并发 N 就要 N×4GB** |
-| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 2–4GB 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，落在 Docker Root Dir） |
+| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 4–6GB 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，里面要放目标镜像 + 智能体镜像） |
 
 ---
 
@@ -338,9 +342,10 @@ docker compose -f compose.batch.yaml logs -f
 
 ```bash
 docker compose -f compose.batch.yaml down
-# 智能体和 dind 都是兄弟容器，compose down 不会连带停掉
-docker ps --filter name=trilane-cg -q | xargs -r docker stop
+# dind 是兄弟容器，compose down 不会连带停掉；智能体跑在 dind 内部，
+# 停掉 dind 就一并带走了（宿主 `docker ps` 看不到 trilane-cg-*）。
 docker ps --filter name=trilane-dind -q | xargs -r docker rm -f
+docker volume ls -q --filter name=trilane-dind | xargs -r docker volume rm -f
 ```
 
 `compose.batch.yaml` 里有两条关键设置：
@@ -406,10 +411,12 @@ docker logs -f trilane-batch-1
 
 ### 一个重要的行为差异
 
-runner 起的智能体容器是**兄弟容器**（sibling），不是子进程。所以：
+runner 起的 dind 是**兄弟容器**（sibling），智能体又跑在 dind 内部。所以：
 
-- 停掉 runner **不会**杀掉正在跑的智能体；
-- 想让智能体也停，得单独 `docker stop trilane-cg-*`；
+- 停掉 runner **不会**杀掉正在跑的智能体和 dind；
+- 想让它们停，得 `docker rm -f trilane-dind-*`（智能体随 dind 一起消失）；
+- 宿主 `docker ps` 看不到 `trilane-cg-*`，要看必须
+  `docker exec <dind> docker ps`；
 - 反过来，runner 重启后可以接着跑（续跑会跳过已完成的）。
 
 ---
@@ -425,7 +432,7 @@ runner 起的智能体容器是**兄弟容器**（sibling），不是子进程�
 | `--api-key` | `$CYBERGYM_API_KEY` | 只用于 fix 侧判定 |
 | `--salt` | `CyberGym` | **必须与服务端一致**，否则 400 Invalid checksum |
 | `--agent-id` | 按批次生成 | **上传归账用**，同批用同一个 |
-| `--isolation` | `dind` | `dind` = 每任务独立 daemon；`host` = 旧行为，直连宿主 daemon |
+| `--isolation` | `dind` | `dind` = 智能体和目标容器都跑在每任务独立的 daemon 里；`host` = 旧行为，智能体直连宿主 daemon |
 | `--dind-image` | `docker:dind` | DinD 镜像 |
 | `--concurrency` | 2 | 并发任务数；内存受限，建议 1–2 |
 | `--timeout-sec` | 14400 | 单任务超时（4 小时） |
@@ -526,10 +533,12 @@ docker ps --filter ancestor=n132/arvo --format '{{.Names}}' | xargs -r docker rm
 ```
 
 **DinD**：默认 `--isolation dind`。每个任务创建独立的 `docker:dind`（数据卷在 Docker Root
-Dir），需要宿主允许 `--privileged`。目标镜像必须先存在宿主，runner 会 `docker save | docker exec
-... docker load` 灌进 dind；dind 容器自身保留默认网络，但内层目标容器按提示词使用
-`--network none`，不依赖 dind 拉取镜像。任务结束/超时 runner 会删除 dind 及其 named
-volume；runner 崩溃可能残留，可手动清：
+Dir），需要宿主允许 `--privileged`。**目标镜像和智能体镜像都必须先在宿主上**，runner 会用
+`docker save | docker exec ... docker load` 把两者都灌进 dind（智能体镜像 817MB 也要算进
+启动时间）；智能体容器再由 `docker exec <dind> docker run` 创建，因此智能体和它拉起的
+目标容器都只存在于这个私有 daemon 里。内层目标容器按提示词使用 `--network none`，
+不依赖 dind 拉取镜像。任务结束/超时 runner 会删除 dind 及其 named volume；runner 崩溃
+可能残留，可手动清：
 
 ```bash
 docker ps -aq --filter label=trilane.role=dind | xargs -r docker rm -f

@@ -11,9 +11,10 @@
 #   docker compose -f compose.batch.yaml up -d
 #   docker compose -f compose.batch.yaml logs -f
 #
-#   # 停：先停编排器，再清它拉起的智能体（两者是兄弟容器，不会连带停）
+#   # 停：先停编排器，再清它拉起的 dind（智能体跑在 dind 内部，随之一起消失）
 #   docker compose -f compose.batch.yaml down
-#   docker ps --filter name=trilane-cg -q | xargs -r docker stop
+#   docker ps --filter name=trilane-dind -q | xargs -r docker rm -f
+#   docker volume ls -q --filter name=trilane-dind | xargs -r docker volume rm -f
 #
 # 设计要点
 # --------

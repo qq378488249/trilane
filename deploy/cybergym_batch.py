@@ -578,6 +578,7 @@ def start_dind(task: TaskRef, task_root: Path, args: argparse.Namespace) -> Dind
     run_volume = f"trilane-dind-{task.slug}-{suffix}-run"
     d_task = daemon_path(task_root / "task")
     d_out = daemon_path(task_root / "out")
+    d_state = daemon_path(task_root / "state" / "trilane")
 
     created: list[str] = []
     try:
@@ -604,9 +605,11 @@ def start_dind(task: TaskRef, task_root: Path, args: argparse.Namespace) -> Dind
             "-e", f"DOCKER_HOST=unix://{DIND_SOCKET_DIR}/docker.sock",
             "-v", f"{data_volume}:/var/lib/docker",
             "-v", f"{run_volume}:{DIND_SOCKET_DIR}",
-            # 目标容器要 bind mount 任务目录；dind 的 daemon 必须也能看到同一路径。
+            # 智能体容器由 dind 自己创建，所以 dind 也必须能看到这些宿主路径，
+            # 否则它发出的 `docker run -v <path>:<path>` 解析不到。
             "-v", f"{d_task}:{d_task}",
             "-v", f"{d_out}:{d_out}",
+            "-v", f"{d_state}:{d_state}",
             args.dind_image,
             f"--host=unix://{DIND_SOCKET_DIR}/docker.sock",
             "--iptables=false",
@@ -682,6 +685,74 @@ def stop_dind(handle: DindHandle) -> None:
         run(["docker", "volume", "rm", "-f", volume], timeout=60)
 
 
+def run_agent_in_dind(
+    handle: DindHandle,
+    *,
+    container: str,
+    image: str,
+    task_slug: str,
+    d_task: str,
+    d_out: str,
+    d_state: str,
+    args: argparse.Namespace,
+    log_path: Path,
+) -> int | None:
+    """在 dind 内部创建并运行智能体容器，返回退出码；硬超时返回 None。
+
+    智能体本身也跑在 dind 里，所以它能看到的 daemon 只有这个私有的 dockerd，
+    宿主 daemon 对它完全不可见。socket 在 dind 内是 DIND_SOCKET_DIR，
+    挂成 /var/run/docker.sock 让镜像里的 docker CLI 直接用默认地址。
+
+    网络用 host：dind 启动时带了 --bridge=none --iptables=false（不碰宿主
+    iptables），它内部的 docker0 不存在，桥接网络起不来；host 网络让智能体
+    直接复用 dind 容器的网络栈，才能连上模型端点。目标容器仍按提示词用
+    --network none，不受影响。
+    """
+    inner = [
+        "docker", "run", "--rm", "--name", container,
+        "--network", "host",
+        "--label", "trilane.role=agent",
+        "--label", f"trilane.task={task_slug}",
+        "--label", f"trilane.batch={args.agent_id}",
+        "-v", f"{DIND_SOCKET_DIR}/docker.sock:/var/run/docker.sock",
+        # 同路径挂载：容器内看到的路径 == dind daemon 解析的路径
+        "-v", f"{d_task}:{d_task}",
+        "-v", f"{d_out}:{d_out}",
+        "-v", f"{d_state}:/root/.trilane",
+        "-e", "HOME=/root",
+        image,
+        "--headless",
+        "--objective-file", f"{d_task}/TASK.md",
+        "--out-dir", d_out,
+        "--cwd", d_task,
+        "--audit-mode", args.audit_mode,
+        "--headless-timeout-sec", str(args.timeout_sec),
+    ]
+    cmd = ["docker", "exec", handle.name] + inner
+
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
+        )
+        try:
+            # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
+            proc.wait(timeout=args.timeout_sec + 600)
+            return proc.returncode
+        except subprocess.TimeoutExpired:
+            # 容器在 dind 里，必须让 dind 去杀；宿主看不到它。
+            run(["docker", "exec", handle.name, "docker", "rm", "-f", container], timeout=120)
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=60)
+            return None
+
+
 def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOutcome:
     task_dir = task_root / "task"
     out_dir = task_root / "out"
@@ -711,6 +782,8 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                     )
                 log(f"[{task.task_id}] 导入目标镜像到 DinD ...")
                 load_image_into_dind(dind, task.vul_image)
+                log(f"[{task.task_id}] 导入智能体镜像到 DinD ...")
+                load_image_into_dind(dind, args.agent_image)
                 log(f"[{task.task_id}] DinD 就绪")
             except Exception as exc:
                 return RunOutcome(
@@ -721,59 +794,61 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                     f"DinD 初始化失败：{exc}",
                 )
 
-        cmd = [
-            "docker", "run", "--rm", "--name", container,
-            "--label", "trilane.role=agent",
-            "--label", f"trilane.task={task.slug}",
-            "--label", f"trilane.batch={args.agent_id}",
-        ]
-        if args.isolation == "dind":
-            assert dind is not None
-            cmd += [
-                "-v", f"{dind.run_volume}:{DIND_SOCKET_DIR}",
-                "-e", f"DOCKER_HOST=unix://{DIND_SOCKET_DIR}/docker.sock",
-            ]
-        else:
-            # 旧路径：智能体直接连宿主 daemon，只保留作逃生/兼容。
-            cmd += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
-        cmd += [
-            # 同路径挂载：容器内看到的路径 == daemon 解析的路径
-            "-v", f"{d_task}:{d_task}",
-            "-v", f"{d_out}:{d_out}",
-            "-v", f"{d_state}:/root/.trilane",
-            "-e", "HOME=/root",
-        ]
-        cmd += [
-            args.agent_image,
-            "--headless",
-            "--objective-file", f"{d_task}/TASK.md",
-            "--out-dir", d_out,
-            "--cwd", d_task,
-            "--audit-mode", args.audit_mode,
-            "--headless-timeout-sec", str(args.timeout_sec),
-        ]
-
-        with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
+            rc = run_agent_in_dind(
+                dind,
+                container=container,
+                image=args.agent_image,
+                task_slug=task.slug,
+                d_task=d_task,
+                d_out=d_out,
+                d_state=d_state,
+                args=args,
+                log_path=log_path,
             )
-            try:
-                # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
-                proc.wait(timeout=args.timeout_sec + 600)
-                rc = proc.returncode
-            except subprocess.TimeoutExpired:
-                run(["docker", "rm", "-f", container])
+            duration = time.monotonic() - started
+        else:
+            cmd = [
+                "docker", "run", "--rm", "--name", container,
+                "--label", "trilane.role=agent",
+                "--label", f"trilane.task={task.slug}",
+                "--label", f"trilane.batch={args.agent_id}",
+                # 旧路径：智能体直接连宿主 daemon，只保留作逃生/兼容。
+                "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                # 同路径挂载：容器内看到的路径 == daemon 解析的路径
+                "-v", f"{d_task}:{d_task}",
+                "-v", f"{d_out}:{d_out}",
+                "-v", f"{d_state}:/root/.trilane",
+                "-e", "HOME=/root",
+                args.agent_image,
+                "--headless",
+                "--objective-file", f"{d_task}/TASK.md",
+                "--out-dir", d_out,
+                "--cwd", d_task,
+                "--audit-mode", args.audit_mode,
+                "--headless-timeout-sec", str(args.timeout_sec),
+            ]
+
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
+                )
                 try:
-                    proc.wait(timeout=120)
+                    # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
+                    proc.wait(timeout=args.timeout_sec + 600)
+                    rc = proc.returncode
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=60)
-                rc = None
-        duration = time.monotonic() - started
+                    run(["docker", "rm", "-f", container])
+                    try:
+                        proc.wait(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=60)
+                    rc = None
+            duration = time.monotonic() - started
 
         result_path = out_dir / "result.json"
         result: dict = {}
@@ -1227,7 +1302,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="每个候选重复提交几轮取多数票；MSan 未初始化读的结果不稳定，1 = 不做投票",
     )
     parser.add_argument("--audit-mode", choices=("lab", "safe"), default="lab", help="TriLane 审计模式")
-    parser.add_argument("--agent-image", default="trilane-headless:latest", help="智能体镜像")
+    parser.add_argument(
+        "--agent-image",
+        default=os.environ.get("AGENT_IMAGE", "trilane-headless:1.0.1"),
+        help="智能体镜像",
+    )
     parser.add_argument(
         "--isolation",
         choices=("dind", "host"),
