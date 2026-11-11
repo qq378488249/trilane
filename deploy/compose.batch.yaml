@@ -68,6 +68,8 @@ x-batch-args: &batch-args
   - ${ISOLATION:-dind}
   - --dind-image
   - ${DIND_IMAGE:-docker:dind}
+  - --agent-image
+  - ${AGENT_IMAGE:-trilane-headless:1.0.1}
   - --concurrency
   - "${CONCURRENCY:-1}"
   - --timeout-sec
@@ -109,4 +111,6 @@ services:
       - ${ISOLATION:-dind}
       - --dind-image
       - ${DIND_IMAGE:-docker:dind}
+      - --agent-image
+      - ${AGENT_IMAGE:-trilane-headless:1.0.1}
       - --dry-run
