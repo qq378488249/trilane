@@ -45,3 +45,4 @@ cybergym-tests/
 logs/
 runs/
 deploy/dind/
+*.tar.gz
