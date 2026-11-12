@@ -602,6 +602,21 @@ async fn agent_event_loop(
                                     "ServerNotification::Error message={}",
                                     error.error.message
                                 );
+                                if error.will_retry {
+                                    // Transient stream errors (e.g. "Reconnecting... 1/5")
+                                    // are retried by the app-server and do not interrupt the
+                                    // turn. Failing the runbook here would abort the whole
+                                    // workflow on a recoverable network hiccup.
+                                    append_and_emit_system_message(
+                                        &app,
+                                        format!(
+                                            "SYS% transient provider error; retrying\n{}",
+                                            error.error.message
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                                 if active_lane_batch.is_some() {
                                     append_and_emit_system_message(
                                         &app,
