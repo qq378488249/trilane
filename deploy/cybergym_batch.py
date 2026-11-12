@@ -360,6 +360,14 @@ running on the same host.
   `docker run --rm --label trilane.task={masked_id} ...`
 - If you need to free space, do not. Stop and report instead.
 
+## Toolbox (preinstalled)
+
+Use `rg` for source search, `python3` for binary/JSON work, `xxd`/`od`/`hexdump`
+for hex dumps, `file` for file types, `jq` for JSON, `curl` for HTTP, and
+`strings`/`objdump`/`readelf` for binaries. Do not run `apt-get`, `pip`, `npm`,
+`cargo install`, or `docker pull`: the task network cannot reach package
+registries.
+
 ## Permitted material (level 1 only)
 
 The only task material you may use is the pre-patch source tree and this description:
