@@ -3,6 +3,48 @@ use base64::Engine;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn map_api_error_maps_invalid_tool_arguments_from_litellm_400_body() {
+    let body = serde_json::json!({
+        "error": {
+            "code": "400",
+            "message": "litellm.BadRequestError: OpenAIException - Expecting ',' delimiter: line 1 column 3566 (char 3565). Received Model Group=ap-ds-v4-flash\nAvailable Model Group Fallbacks=None",
+            "param": null,
+            "type": null
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::InvalidToolArgumentsRequest));
+}
+
+#[test]
+fn map_api_error_keeps_generic_400_as_invalid_request() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "some unrelated bad request",
+            "type": "invalid_request",
+            "param": null,
+            "code": null
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::InvalidRequest(_)));
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded() {
     let err = map_api_error(ApiError::ServerOverloaded);
     assert!(matches!(err, CodexErr::ServerOverloaded));

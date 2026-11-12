@@ -548,6 +548,72 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
 }
 
 #[test]
+fn for_prompt_repairs_malformed_function_call_arguments() {
+    let history = create_history_with_items(vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            // Truncated JSON: the model stopped writing before closing the object.
+            arguments: "{\"cmd\":\"cat > poc/manifest.json << 'EOF'\n{\nEOF".to_string(),
+            call_id: "call-broken".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-broken".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "failed to parse function arguments: EOF while parsing an object".to_string(),
+            ),
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: "{\"cmd\":\"ls\"}".to_string(),
+            call_id: "call-ok".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-ok".to_string(),
+            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        },
+    ]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+    let arguments: Vec<&str> = prompt
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { arguments, .. } => Some(arguments.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(arguments, vec!["{}", "{\"cmd\":\"ls\"}"]);
+}
+
+#[test]
+fn repair_invalid_function_arguments_reports_whether_history_changed() {
+    let mut history = create_history_with_items(vec![ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: "{\"cmd\":\"echo hi\"".to_string(),
+        call_id: "call-broken".to_string(),
+    }]);
+
+    assert!(history.repair_invalid_function_arguments());
+
+    let arguments: Vec<&str> = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { arguments, .. } => Some(arguments.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arguments, vec!["{}"]);
+    assert!(!history.repair_invalid_function_arguments());
+}
+
+#[test]
 fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     let history = create_history_with_items(vec![
         ResponseItem::Message {

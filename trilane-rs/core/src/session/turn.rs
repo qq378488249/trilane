@@ -379,6 +379,21 @@ pub(crate) async fn run_turn(
                 sess.send_event(&turn_context, event).await;
                 break;
             }
+            Err(err @ CodexErr::InvalidToolArgumentsRequest) => {
+                let repaired = {
+                    let mut state = sess.state.lock().await;
+                    state.history.repair_invalid_function_arguments()
+                };
+                if repaired {
+                    warn!(
+                        "upstream rejected the request because a historical tool call had malformed JSON arguments; repaired history and retrying"
+                    );
+                    continue;
+                }
+                sess.send_event(&turn_context, EventMsg::Error(err.to_error_event(None)))
+                    .await;
+                break;
+            }
             Err(e) => {
                 info!("Turn error: {e:#}");
                 if e.to_codex_protocol_error() == CodexErrorInfo::UsageLimitExceeded

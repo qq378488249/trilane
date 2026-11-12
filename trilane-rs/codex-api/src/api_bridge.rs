@@ -73,6 +73,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         .contains("The image data you provided does not represent a valid image")
                     {
                         CodexErr::InvalidImageRequest()
+                    } else if looks_like_invalid_tool_arguments(&body_text) {
+                        CodexErr::InvalidToolArgumentsRequest
                     } else {
                         CodexErr::InvalidRequest(body_text)
                     }
@@ -145,6 +147,25 @@ const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
+
+/// Upstreams that re-parse `function.arguments` as JSON (OpenAI-compatible
+/// proxies such as LiteLLM) reject the whole request with HTTP 400 when a
+/// historical tool call carries malformed JSON. Recognize that signature so the
+/// session can repair the history and retry instead of failing the turn.
+fn looks_like_invalid_tool_arguments(body: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "expecting ',' delimiter",
+        "expecting ',' or '}'",
+        "expecting property name enclosed in double quotes",
+        "unterminated string",
+        "eof while parsing",
+        "invalid function arguments",
+        "invalid_function_call_arguments",
+        "failed to parse function arguments",
+    ];
+    let body = body.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| body.contains(marker))
+}
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]

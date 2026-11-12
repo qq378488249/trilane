@@ -109,6 +109,11 @@ pub enum CodexErr {
     /// Invalid image.
     #[error("Image poisoning")]
     InvalidImageRequest(),
+    /// The upstream rejected the request because a historical tool call carried
+    /// malformed JSON in its `arguments`. The session repairs the history and
+    /// retries the request once before surfacing this error.
+    #[error("Invalid tool call arguments")]
+    InvalidToolArgumentsRequest,
     #[error("{0}")]
     UsageLimitReached(UsageLimitReachedError),
     #[error("Selected model is at capacity. Please try a different model.")]
@@ -179,6 +184,7 @@ impl CodexErr {
             | CodexErr::UsageNotIncluded
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
+            | CodexErr::InvalidToolArgumentsRequest
             | CodexErr::InvalidRequest(_)
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
@@ -240,6 +246,7 @@ impl CodexErr {
             | CodexErr::InternalAgentDied => CodexErrorInfo::InternalServerError,
             CodexErr::UnsupportedOperation(_)
             | CodexErr::ThreadNotFound(_)
+            | CodexErr::InvalidToolArgumentsRequest
             | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,

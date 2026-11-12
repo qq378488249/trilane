@@ -359,10 +359,22 @@ impl ContextManager {
         }
     }
 
+    /// Rewrite malformed function call `arguments` in-place so the next request
+    /// remains parseable, bumping the history version when anything changed.
+    /// Returns `true` when at least one call was repaired.
+    pub(crate) fn repair_invalid_function_arguments(&mut self) -> bool {
+        let repaired = normalize::repair_invalid_function_arguments(&mut self.items);
+        if repaired {
+            self.history_version = self.history_version.saturating_add(1);
+        }
+        repaired
+    }
+
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
     /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    /// 4. every function call carries syntactically valid JSON in its `arguments`
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
@@ -372,6 +384,9 @@ impl ContextManager {
 
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+
+        // malformed tool call arguments must not brick the whole request
+        normalize::repair_invalid_function_arguments(&mut self.items);
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {

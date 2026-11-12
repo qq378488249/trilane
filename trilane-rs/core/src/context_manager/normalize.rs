@@ -119,6 +119,45 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     }
 }
 
+/// Ensure every model-visible function call carries syntactically valid JSON in
+/// `arguments`.
+///
+/// The Responses API returns `arguments` as an opaque string, so a model can end
+/// a response mid-JSON (a truncated or malformed tool call). Strict upstreams
+/// (OpenAI-compatible proxies in particular) reject the *whole* request when
+/// re-parsing that string, which would otherwise brick the conversation after a
+/// single bad generation. Replace the malformed payload with `{}` so the next
+/// request stays valid; the paired tool output already tells the model that its
+/// arguments failed to parse.
+///
+/// Returns `true` when at least one call was rewritten.
+pub(crate) fn repair_invalid_function_arguments(items: &mut [ResponseItem]) -> bool {
+    let mut repaired = false;
+
+    for item in items.iter_mut() {
+        let ResponseItem::FunctionCall {
+            name, arguments, ..
+        } = item
+        else {
+            continue;
+        };
+
+        if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+            continue;
+        }
+
+        tracing::warn!(
+            tool = %name,
+            argument_bytes = arguments.len(),
+            "replacing malformed function call arguments with {{}} before sending to the model"
+        );
+        *arguments = "{}".to_string();
+        repaired = true;
+    }
+
+    repaired
+}
+
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     let function_call_ids: HashSet<String> = items
         .iter()
