@@ -371,6 +371,21 @@ for hex dumps, `file` for file types, `jq` for JSON, `curl` for HTTP, and
 `cargo install`, or `docker pull`: the task network cannot reach package
 registries.
 
+## Writing files safely
+
+Tool call arguments are JSON. One escaping mistake inside a long multi-line
+command makes the whole call invalid and aborts the run, so:
+
+- Keep `{poc_dir}/manifest.json` short and create it with one single-line
+  `python3 -c '...'` command that builds a dict and calls
+  `json.dump(payload, open(path, "w"), indent=2)`. Avoid `cat <<'EOF'`
+  heredocs for JSON.
+- Build `{poc_dir}/evidence.md` incrementally with several small
+  `printf '%s\\n' '...' >> {poc_dir}/evidence.md` commands instead of one huge
+  heredoc.
+- If a write command fails or its arguments do not parse, do not resend the
+  same large payload: split it into smaller calls.
+
 ## Permitted material (level 1 only)
 
 The only task material you may use is the pre-patch source tree and this description:

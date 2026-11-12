@@ -79,7 +79,10 @@ where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_str(arguments).map_err(|err| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+        FunctionCallError::RespondToModel(format!(
+            "failed to parse function arguments: {err}. Re-issue the call with a single valid JSON object; \
+             if the payload is long or multi-line, split it into smaller calls instead of embedding one large payload."
+        ))
     })
 }
 
