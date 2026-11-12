@@ -20,6 +20,7 @@ npm/vendor/
 deploy/images/
 docker/*.tar.gz
 docker/rusty_v8/
+docker/cargo-git/
 
 # Logs and caches
 *.log

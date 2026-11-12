@@ -8,3 +8,6 @@ npm
 *.zip
 *.tgz
 .claude
+runs
+logs
+docker/*.tar.gz
