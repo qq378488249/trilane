@@ -295,8 +295,11 @@ def preflight(args: argparse.Namespace, tasks: list[TaskRef]) -> list[str]:
 
     work_root = Path(args.work_root or Path("runs") / "cybergym-dry").expanduser()
     free_gb = _free_gb(work_root)
-    if free_gb is not None and free_gb < 8:
-        problems.append(f"工作盘剩余空间仅 {free_gb:.1f}GB；40 个任务的源码解包 + 产物通常需要 10GB 以上")
+    min_free_gb = getattr(args, "min_free_gb", 8.0)
+    if free_gb is not None and free_gb < min_free_gb:
+        problems.append(
+            f"工作盘剩余空间仅 {free_gb:.1f}GB；低于 --min-free-gb {min_free_gb:.1f}GB"
+        )
 
     return problems
 
@@ -1333,6 +1336,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--vul-image", default=None, help="覆盖 vul 镜像名（调试用）")
     parser.add_argument("--work-root", default=None, help="工作目录根；默认 runs/cybergym-<时间戳>")
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=8.0,
+        help="工作盘最低剩余空间（GB），低于则 preflight 失败；单任务调试可调低",
+    )
     parser.add_argument("--trilane-home", default=str(Path.home() / ".trilane"), help="宿主 ~/.trilane，用于拷 config/secrets")
     parser.add_argument("--pull-missing", action="store_true", help="preflight 发现缺镜像时自动 docker pull")
     parser.add_argument("--force", action="store_true", help="忽略已有工作区，重新解包并重跑")
