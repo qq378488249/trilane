@@ -1,0 +1,19 @@
+# TriLane provider config for the local mock LLM.
+#
+# Copy this file to <TRILANE_HOME>/config.toml, and secrets.toml next to it.
+# The `adapter = "chat-completions"` line makes trilane-gui start its in-process
+# Responses -> Chat Completions adapter and forward to <base_url>/chat/completions.
+
+model = "mock-model"
+model_provider = "mock"
+
+[model_providers.mock]
+name = "Mock Chat LLM"
+base_url = "http://127.0.0.1:8787/v1"
+env_key = "MOCK_API_KEY"
+wire_api = "responses"
+adapter = "chat-completions"
+supports_websockets = false
+request_max_retries = 8
+stream_max_retries = 10
+stream_idle_timeout_ms = 300000

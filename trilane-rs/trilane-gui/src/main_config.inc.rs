@@ -23,6 +23,14 @@ pub struct CustomProvider {
 }
 
 fn trilane_home() -> std::path::PathBuf {
+    // Lets tests and container runs point at an isolated state directory
+    // instead of the user's real ~/.trilane.
+    if let Ok(value) = std::env::var("TRILANE_HOME") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return std::path::PathBuf::from(value);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join(".trilane")
