@@ -255,7 +255,7 @@ impl ActiveLaneBatch {
     fn can_retry(&self, index: usize) -> bool {
         self.lanes
             .get(index)
-            .is_some_and(|lane| lane.attempts < WORKFLOW_LANE_MAX_ATTEMPTS)
+            .is_some_and(|lane| lane.attempts < workflow_lane_max_attempts())
     }
 
     fn all_complete(&self) -> bool {

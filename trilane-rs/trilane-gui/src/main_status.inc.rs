@@ -6,13 +6,24 @@ fn workflow_lane_concurrency() -> usize {
         .unwrap_or(DEFAULT_WORKFLOW_LANE_CONCURRENCY)
 }
 
+fn workflow_lane_env_u64(name: &str, default: u64, range: std::ops::RangeInclusive<u64>) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| range.contains(value))
+        .unwrap_or(default)
+}
+
+fn workflow_lane_max_attempts() -> u8 {
+    workflow_lane_env_u64("TRILANE_LANE_MAX_ATTEMPTS", 8, 1..=20) as u8
+}
+
 fn workflow_lane_retry_delay(attempt: u8) -> Duration {
-    let seconds = match attempt {
-        0 | 1 => 20,
-        2 => 45,
-        _ => 90,
-    };
-    Duration::from_secs(seconds)
+    let base = workflow_lane_env_u64("TRILANE_LANE_RETRY_BASE_SECS", 20, 1..=3600);
+    let cap = workflow_lane_env_u64("TRILANE_LANE_RETRY_MAX_SECS", 30, 1..=3600);
+    let exponent = attempt.saturating_sub(1).min(31) as i32;
+    let seconds = (base as f64 * 2f64.powi(exponent)).min(cap as f64);
+    Duration::from_secs_f64(seconds)
 }
 
 fn workflow_lane_idle_timeout() -> Duration {
@@ -24,20 +35,25 @@ fn workflow_lane_idle_timeout() -> Duration {
         .unwrap_or(DEFAULT_WORKFLOW_LANE_IDLE_TIMEOUT)
 }
 
-fn is_retryable_lane_error(message: &str) -> bool {
+/// Retries every turn error unless it is clearly not recoverable by resending:
+/// a cancelled turn, or a steer that the active turn could not accept.
+fn should_retry_lane_error(error: &codex_app_server_protocol::TurnError) -> bool {
+    match error.codex_error_info {
+        Some(codex_app_server_protocol::CodexErrorInfo::ActiveTurnNotSteerable { .. }) => false,
+        Some(_) => true,
+        None => !looks_like_cancellation(&error.message),
+    }
+}
+
+fn looks_like_cancellation(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("429")
-        || lower.contains("too many requests")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("exceeded retry limit")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("timeout")
+    lower.contains("interrupted") || lower.contains("aborted") || lower.contains("cancel")
 }
 
 fn retry_status_summary(error: &str, attempt: u8, delay: Duration) -> String {
     format!(
-        "provider backoff after retryable error; attempt={attempt}/{WORKFLOW_LANE_MAX_ATTEMPTS} retry_after={}s error={}",
+        "provider backoff after retryable error; attempt={attempt}/{} retry_after={}s error={}",
+        workflow_lane_max_attempts(),
         delay.as_secs(),
         truncate_for_status(error, 180)
     )

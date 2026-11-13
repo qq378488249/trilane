@@ -220,11 +220,12 @@ async fn agent_event_loop(
                                         {
                                             let stage_id = batch.stage_id.clone();
                                             let lane_id = batch.lanes[index].lane_id.clone();
-                                            let retryable_error = turn_error
-                                                .as_deref()
-                                                .is_some_and(is_retryable_lane_error);
-                                            let should_retry_error = turn_error.as_deref().is_some()
-                                                && retryable_error
+                                            let retryable_error = turn
+                                                .turn
+                                                .error
+                                                .as_ref()
+                                                .is_some_and(should_retry_lane_error);
+                                            let should_retry_error = retryable_error
                                                 && batch.can_retry(index);
                                             let (lane_status, lane_detail) = if should_retry_error {
                                                 let attempt = batch.lanes[index].attempts;

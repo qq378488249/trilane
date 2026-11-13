@@ -67,7 +67,6 @@ const MIMO_API_KEY_ENV: &str = "XIAOMI_API_KEY";
 const DEFAULT_WORKFLOW_LANE_CONCURRENCY: usize = 2;
 const RUNBOOK_MARKER_FLUSH_BATCH_LINES: usize = 12;
 const RUNBOOK_MARKER_FLUSH_INTERVAL: Duration = Duration::from_millis(350);
-const WORKFLOW_LANE_MAX_ATTEMPTS: u8 = 3;
 const WORKFLOW_LANE_RETRY_TICK: Duration = Duration::from_secs(1);
 const DEFAULT_WORKFLOW_LANE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 

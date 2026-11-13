@@ -6,13 +6,52 @@
         }
     }
 
+    fn turn_error(
+        message: &str,
+        info: Option<codex_app_server_protocol::CodexErrorInfo>,
+    ) -> codex_app_server_protocol::TurnError {
+        codex_app_server_protocol::TurnError {
+            message: message.to_string(),
+            codex_error_info: info,
+            additional_details: None,
+        }
+    }
+
     #[test]
-    fn retryable_lane_errors_cover_provider_rate_limits() {
-        assert!(is_retryable_lane_error(
-            "exceeded retry limit, last status: 429 Too Many Requests"
-        ));
-        assert!(is_retryable_lane_error("provider rate_limit was reached"));
-        assert!(!is_retryable_lane_error("invalid model name"));
+    fn retryable_lane_errors_cover_provider_failures() {
+        use codex_app_server_protocol::CodexErrorInfo;
+
+        assert!(should_retry_lane_error(&turn_error(
+            "exceeded retry limit, last status: 429 Too Many Requests",
+            Some(CodexErrorInfo::ResponseTooManyFailedAttempts {
+                http_status_code: Some(429),
+            }),
+        )));
+        assert!(should_retry_lane_error(&turn_error(
+            "unexpected status 503 Service Unavailable",
+            None,
+        )));
+        assert!(should_retry_lane_error(&turn_error(
+            "unauthorized",
+            Some(CodexErrorInfo::Unauthorized),
+        )));
+        assert!(!should_retry_lane_error(&turn_error(
+            "turn was interrupted by the user",
+            None,
+        )));
+        assert!(!should_retry_lane_error(&turn_error(
+            "active turn cannot accept steering",
+            Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: codex_app_server_protocol::NonSteerableTurnKind::Review,
+            }),
+        )));
+    }
+
+    #[test]
+    fn lane_retry_delay_grows_then_stops_at_cap() {
+        assert_eq!(workflow_lane_retry_delay(1), Duration::from_secs(20));
+        assert_eq!(workflow_lane_retry_delay(2), Duration::from_secs(30));
+        assert_eq!(workflow_lane_retry_delay(8), Duration::from_secs(30));
     }
 
     #[test]

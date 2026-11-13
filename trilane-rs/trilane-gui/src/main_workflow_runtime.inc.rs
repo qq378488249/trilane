@@ -294,7 +294,7 @@ async fn start_workflow_lane_batch(
             batch.stage_id,
             batch.is_repair,
             workflow_lane_concurrency().min(batch.lanes.len()),
-            WORKFLOW_LANE_MAX_ATTEMPTS,
+            workflow_lane_max_attempts(),
             batch
                 .lanes
                 .iter()
@@ -349,7 +349,10 @@ async fn start_ready_workflow_lanes(
         batch.lanes[index].mark_starting();
         let lane_id = batch.lanes[index].lane_id.clone();
         let attempt = batch.lanes[index].attempts;
-        let summary = format!("starting attempt {attempt}/{WORKFLOW_LANE_MAX_ATTEMPTS}");
+        let summary = format!(
+            "starting attempt {attempt}/{}",
+            workflow_lane_max_attempts()
+        );
         record_workflow_lane_status(
             app,
             WorkflowLaneStatus {
@@ -394,7 +397,10 @@ async fn start_ready_workflow_lanes(
         };
 
         batch.lanes[index].thread_id = thread_id.clone();
-        let summary = format!("thread started; attempt {attempt}/{WORKFLOW_LANE_MAX_ATTEMPTS}");
+        let summary = format!(
+            "thread started; attempt {attempt}/{}",
+            workflow_lane_max_attempts()
+        );
         record_workflow_lane_status(
             app,
             WorkflowLaneStatus {
@@ -453,7 +459,9 @@ async fn mark_workflow_lane_start_error(
     let lane_id = batch.lanes[index].lane_id.clone();
     let thread_id = batch.lanes[index].thread_id.clone();
     let attempt = batch.lanes[index].attempts;
-    let (status, summary) = if is_retryable_lane_error(error) && batch.can_retry(index) {
+    // Starting a lane goes through the app-server; a failure here is a
+    // transport/RPC problem, not a model error, so always retry it.
+    let (status, summary) = if batch.can_retry(index) {
         let delay = batch.retry_lane(index, error);
         ("retrying", retry_status_summary(error, attempt, delay))
     } else {
@@ -461,7 +469,8 @@ async fn mark_workflow_lane_start_error(
         (
             "failed",
             format!(
-                "lane start failed after attempt {attempt}/{WORKFLOW_LANE_MAX_ATTEMPTS}: {}",
+                "lane start failed after attempt {attempt}/{}: {}",
+                workflow_lane_max_attempts(),
                 truncate_for_status(error, 220)
             ),
         )
@@ -504,8 +513,9 @@ async fn recover_idle_workflow_lanes(app: &AppHandle, batch: &mut ActiveLaneBatc
         batch.finish_lane(index, /*failed*/ false);
         let lane_status = "done";
         let lane_detail = format!(
-            "lane idle timeout after {}s without completion event; joined scheduler-owned lane after attempt={attempt}/{WORKFLOW_LANE_MAX_ATTEMPTS}",
-            timeout.as_secs()
+            "lane idle timeout after {}s without completion event; joined scheduler-owned lane after attempt={attempt}/{}",
+            timeout.as_secs(),
+            workflow_lane_max_attempts()
         );
         let thread_id = if thread_id.is_empty() {
             None
