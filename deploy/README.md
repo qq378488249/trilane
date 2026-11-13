@@ -57,11 +57,12 @@
 
 ### 新服务器（镜像包已在本目录）
 
-`deploy/images/` 里已经有编排器和智能体两个镜像包，直接导入即可：
+`deploy/images/` 里已经有编排器和智能体两个镜像包，直接导入即可
+（`.tgz` 与 `.tar.gz` 都是 gzip 压缩的 tar，新导出统一用 `.tar.gz`，这里两种都收）：
 
 ```bash
 cd deploy
-for f in images/*.tgz; do gunzip -c "$f" | docker load; done
+for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 ```
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
@@ -89,7 +90,7 @@ tar czf cybergym_data.tgz -C /path/to cybergym_data
 ### 新服务器（接着导入）
 
 ```bash
-for f in *.tgz; do gunzip -c "$f" | docker load; done
+for f in *.tgz *.tar.gz; do gunzip -c "$f" | docker load; done
 
 tar xzf cybergym_data.tgz -C /opt/
 cp /opt/cybergym/mask_map.json /opt/
