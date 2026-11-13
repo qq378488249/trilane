@@ -599,3 +599,61 @@ fn usage_limit_reached_with_promo_message() {
         assert_eq!(err.to_string(), expected);
     });
 }
+
+#[test]
+fn is_retryable_covers_provider_failures() {
+    let retryable = vec![
+        CodexErr::Stream("disconnected".to_string(), None),
+        CodexErr::Timeout,
+        CodexErr::RequestTimeout,
+        CodexErr::ServerOverloaded,
+        CodexErr::InternalServerError,
+        CodexErr::QuotaExceeded,
+        CodexErr::UsageNotIncluded,
+        CodexErr::InvalidRequest("bad request".to_string()),
+        CodexErr::CyberPolicy {
+            message: "policy".to_string(),
+        },
+        CodexErr::UsageLimitReached(UsageLimitReachedError {
+            plan_type: None,
+            resets_at: None,
+            rate_limits: None,
+            promo_message: None,
+            rate_limit_reached_type: None,
+        }),
+        CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: String::new(),
+            url: None,
+            cf_ray: None,
+            request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
+        }),
+        CodexErr::RetryLimit(RetryLimitReachedError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            request_id: None,
+            retry_after: None,
+        }),
+    ];
+
+    for err in retryable {
+        assert!(err.is_retryable(), "expected {err} to be retryable");
+    }
+}
+
+#[test]
+fn is_retryable_skips_control_flow_and_repairs() {
+    let final_errors = vec![
+        CodexErr::TurnAborted,
+        CodexErr::Interrupted,
+        CodexErr::ContextWindowExceeded,
+        CodexErr::InvalidImageRequest(),
+        CodexErr::InvalidToolArgumentsRequest,
+        CodexErr::Fatal("boom".to_string()),
+    ];
+
+    for err in final_errors {
+        assert!(!err.is_retryable(), "expected {err} to be final");
+    }
+}

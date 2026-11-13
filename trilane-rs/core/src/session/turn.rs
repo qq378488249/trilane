@@ -995,7 +995,9 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                return Err(CodexErr::UsageLimitReached(e));
+                // Keep the quota snapshot for the UI, but let the retry loop
+                // decide whether another attempt is worth it.
+                CodexErr::UsageLimitReached(e)
             }
             Err(err) => err,
         };

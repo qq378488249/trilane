@@ -1237,6 +1237,7 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut unauthorized_retries: u64 = 0;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -1302,6 +1303,8 @@ impl ModelClientSession {
                         )
                         .await?,
                     );
+                    unauthorized_retries += 1;
+                    tokio::time::sleep(crate::util::backoff(unauthorized_retries)).await;
                     continue;
                 }
                 Err(err) => {
@@ -1353,6 +1356,7 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut unauthorized_retries: u64 = 0;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
@@ -1415,6 +1419,8 @@ impl ModelClientSession {
                         )
                         .await?,
                     );
+                    unauthorized_retries += 1;
+                    tokio::time::sleep(crate::util::backoff(unauthorized_retries)).await;
                     continue;
                 }
                 Err(err) => return Err(map_api_error(err)),

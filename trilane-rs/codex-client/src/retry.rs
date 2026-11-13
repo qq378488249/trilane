@@ -35,6 +35,10 @@ impl RetryOn {
     }
 }
 
+/// Ceiling for a single retry delay so a large retry budget cannot turn into a
+/// multi-hour sleep.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 pub fn backoff(base: Duration, attempt: u64) -> Duration {
     if attempt == 0 {
         return base;
@@ -43,7 +47,7 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
     let millis = base.as_millis() as u64;
     let raw = millis.saturating_mul(exp);
     let jitter: f64 = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((raw as f64 * jitter) as u64)
+    Duration::from_millis((raw as f64 * jitter) as u64).min(MAX_BACKOFF)
 }
 
 pub async fn run_with_retry<T, F, Fut>(

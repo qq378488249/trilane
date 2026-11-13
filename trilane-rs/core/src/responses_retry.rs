@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::util::MAX_BACKOFF;
 use crate::util::backoff;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
@@ -49,9 +50,13 @@ pub(crate) async fn handle_retryable_response_stream_error(
         *retries += 1;
         let retry_count = *retries;
         let delay = match &err {
-            CodexErr::Stream(_, requested_delay) => {
-                requested_delay.unwrap_or_else(|| backoff(retry_count))
-            }
+            CodexErr::Stream(_, requested_delay) => requested_delay
+                .map(|delay| delay.min(MAX_BACKOFF))
+                .unwrap_or_else(|| backoff(retry_count)),
+            CodexErr::RetryLimit(limit) => limit
+                .retry_after
+                .map(|delay| delay.min(MAX_BACKOFF))
+                .unwrap_or_else(|| backoff(retry_count)),
             _ => backoff(retry_count),
         };
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);

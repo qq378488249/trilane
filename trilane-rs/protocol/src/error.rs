@@ -175,43 +175,34 @@ impl From<CancelErr> for CodexErr {
 }
 
 impl CodexErr {
+    /// Whether the caller should retry the request after this error.
+    ///
+    /// Everything model-, network- or server-facing is retried: the deployment
+    /// this runs against is not always reliable, so treating an unexpected
+    /// status or a quota response as final loses far more work than one extra
+    /// round trip costs. Only errors that cannot change on a resend are final.
     pub fn is_retryable(&self) -> bool {
         match self {
-            CodexErr::TurnAborted
-            | CodexErr::Interrupted
+            // Control flow, not an error.
+            CodexErr::TurnAborted | CodexErr::Interrupted
+            // Configuration / environment / programming errors.
             | CodexErr::EnvVar(_)
             | CodexErr::Fatal(_)
-            | CodexErr::UsageNotIncluded
-            | CodexErr::QuotaExceeded
-            | CodexErr::InvalidImageRequest()
-            | CodexErr::InvalidToolArgumentsRequest
-            | CodexErr::InvalidRequest(_)
-            | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
             | CodexErr::LandlockSandboxExecutableNotProvided
-            | CodexErr::RetryLimit(_)
-            | CodexErr::ContextWindowExceeded
             | CodexErr::ThreadNotFound(_)
             | CodexErr::AgentLimitReached { .. }
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
-            | CodexErr::UsageLimitReached(_)
-            | CodexErr::ServerOverloaded
-            | CodexErr::CyberPolicy { .. } => false,
-            CodexErr::Stream(..)
-            | CodexErr::Timeout
-            | CodexErr::RequestTimeout
-            | CodexErr::UnexpectedStatus(_)
-            | CodexErr::ResponseStreamFailed(_)
-            | CodexErr::ConnectionFailed(_)
-            | CodexErr::InternalServerError
             | CodexErr::InternalAgentDied
-            | CodexErr::Io(_)
-            | CodexErr::Json(_)
-            | CodexErr::TokioJoin(_) => true,
+            // The session has to repair history or compact before a resend can succeed.
+            | CodexErr::ContextWindowExceeded
+            | CodexErr::InvalidImageRequest()
+            | CodexErr::InvalidToolArgumentsRequest => false,
             #[cfg(target_os = "linux")]
             CodexErr::LandlockRuleset(_) | CodexErr::LandlockPathFd(_) => false,
+            _ => true,
         }
     }
 
@@ -437,6 +428,8 @@ fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
 pub struct RetryLimitReachedError {
     pub status: StatusCode,
     pub request_id: Option<String>,
+    /// Delay requested by the server (`Retry-After` or rate-limit reset headers).
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for RetryLimitReachedError {
@@ -449,7 +442,11 @@ impl std::fmt::Display for RetryLimitReachedError {
                 .as_ref()
                 .map(|id| format!(", request id: {id}"))
                 .unwrap_or_default()
-        )
+        )?;
+        if let Some(retry_after) = self.retry_after {
+            write!(f, ", retry after: {}s", retry_after.as_secs())?;
+        }
+        Ok(())
     }
 }
 

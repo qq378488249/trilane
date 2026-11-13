@@ -432,3 +432,14 @@ fn normalize_thread_name_trims_and_rejects_empty() {
         Some("my thread".to_string())
     );
 }
+
+#[test]
+fn backoff_is_capped_at_thirty_seconds() {
+    for attempt in [9u64, 20, 100, 1_000] {
+        assert!(
+            backoff(attempt) <= MAX_BACKOFF,
+            "attempt {attempt} exceeded the backoff cap"
+        );
+    }
+    assert!(backoff(1) < MAX_BACKOFF);
+}

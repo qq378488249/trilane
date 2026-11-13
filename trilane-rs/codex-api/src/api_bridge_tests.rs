@@ -301,3 +301,39 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
     );
     assert_eq!(err.identity_error_code.as_deref(), Some("token_expired"));
 }
+
+#[test]
+fn parse_retry_after_prefers_standard_header() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("retry-after", "7".parse().expect("header value"));
+    assert_eq!(
+        parse_retry_after(Some(&headers)),
+        Some(Duration::from_secs(7))
+    );
+}
+
+#[test]
+fn parse_retry_after_reads_rate_limit_reset_literals() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-ratelimit-reset-requests",
+        "6m0s".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(Some(&headers)),
+        Some(Duration::from_secs(360))
+    );
+}
+
+#[test]
+fn parse_duration_literal_handles_compound_units() {
+    assert_eq!(
+        parse_duration_literal("1h2m3s"),
+        Some(Duration::from_secs(3723))
+    );
+    assert_eq!(
+        parse_duration_literal("500ms"),
+        Some(Duration::from_millis(500))
+    );
+    assert_eq!(parse_duration_literal("nonsense"), None);
+}

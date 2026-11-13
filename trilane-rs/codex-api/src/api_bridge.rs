@@ -14,6 +14,7 @@ use codex_protocol::error::UsageLimitReachedError;
 use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Duration;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
     match err {
@@ -109,6 +110,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
+                        retry_after: parse_retry_after(headers.as_ref()),
                     })
                 } else {
                     CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -128,6 +130,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             TransportError::RetryLimit => CodexErr::RetryLimit(RetryLimitReachedError {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 request_id: None,
+                retry_after: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
             TransportError::Network(msg) | TransportError::Build(msg) => {
@@ -186,6 +189,63 @@ fn extract_header(headers: Option<&HeaderMap>, name: &str) -> Option<String> {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
     })
+}
+
+/// How long the server asked us to wait before retrying a throttled request.
+///
+/// Prefers the standard `Retry-After` header (seconds or HTTP-date), then falls
+/// back to the `x-ratelimit-reset-*` duration literals used by OpenAI-compatible
+/// gateways.
+fn parse_retry_after(headers: Option<&HeaderMap>) -> Option<Duration> {
+    if let Some(value) = extract_header(headers, "retry-after") {
+        let value = value.trim();
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+        if let Ok(at) = DateTime::parse_from_rfc2822(value) {
+            return (at.with_timezone(&Utc) - Utc::now()).to_std().ok();
+        }
+    }
+    for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+        if let Some(value) = extract_header(headers, name)
+            && let Some(delay) = parse_duration_literal(value.trim())
+        {
+            return Some(delay);
+        }
+    }
+    None
+}
+
+/// Parses duration literals like `1s`, `500ms`, `6m0s`, `1h2m3s`.
+fn parse_duration_literal(value: &str) -> Option<Duration> {
+    let mut total_ms = 0f64;
+    let mut number = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+            continue;
+        }
+        let amount: f64 = number.parse().ok()?;
+        number.clear();
+        let factor_ms = if ch == 'm' && chars.peek() == Some(&'s') {
+            chars.next();
+            1.0
+        } else {
+            match ch {
+                's' => 1_000.0,
+                'm' => 60_000.0,
+                'h' => 3_600_000.0,
+                'd' => 86_400_000.0,
+                _ => return None,
+            }
+        };
+        total_ms += amount * factor_ms;
+    }
+    if !number.is_empty() || total_ms <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_millis(total_ms as u64))
 }
 
 fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String> {
