@@ -11,3 +11,5 @@ npm
 runs
 logs
 docker/*.tar.gz
+deploy
+deploy.tar.gz
