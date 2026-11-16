@@ -36,7 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.9，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.10，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
@@ -75,8 +75,8 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.9），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.9.tgz` | 71MB | 同上，带版本号的副本 |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.10），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.10.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
@@ -127,7 +127,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.9 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.10 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -233,7 +233,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.9 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.10 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -242,13 +242,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.9 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.9 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.10 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.9 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.10 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -381,7 +381,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.9 \
+  trilane-batch-runner:1.0.10 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -397,7 +397,7 @@ docker run -d --name trilane-batch-1 \
   -v /var/lib/trilane:/var/lib/trilane \
   -v /root/.trilane:/root/.trilane:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.9 \
+  trilane-batch-runner:1.0.10 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -515,9 +515,28 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 某个任务失败了，用 `triage.sh` 一次性看清卡在哪：
 
 ```bash
-sh deploy/triage.sh runs/<批次>            # 人类可读
-sh deploy/triage.sh runs/<批次> --json     # 机器可读
+sh deploy/triage.sh runs/<批次>                          # 查全部
+sh deploy/triage.sh runs/<批次> --task arvo:1856         # 只看一个
+sh deploy/triage.sh runs/<批次> --task arvo:1856 arvo:3736   # 看多个
+sh deploy/triage.sh runs/<批次> --task-file failed.txt   # 从文件读（一行一个）
+sh deploy/triage.sh runs/<批次> --json                   # 机器可读
 ```
+
+`--task` 可传 `task_id`（`arvo:1856`）或 `slug`（`arvo_1856`）；**不传就是查全部**。
+传了但没匹配到的任务会单独列在 `!! 未找到` 下面。
+
+**日志太多时**，用这几个开关做单任务深挖（否则 `agent.log` 动辄十几 MB 没法看）：
+
+```bash
+sh deploy/triage.sh runs/<批次> --task arvo:1856 \
+  --log-errors          # agent.log 的 ERROR/FATAL 行（按消息去重，带出现次数）
+  --log-warnings        # 再带上 WARN 行（引擎有大量无害 WARN，默认不显示）
+  --transcript-tail 30  # 断点 stage 的 transcript 末尾 30 行
+  --log-tail 20         # agent.log 最后 20 行
+```
+
+去重效果示例：某次超时任务的 78 行 WARN/ERROR，合并后只剩 14 条，其中能直接看到
+`stream disconnected - retrying sampling request (1/10 in 186ms)` 这种关键信号。
 
 它会输出：
 
@@ -546,7 +565,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.9 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.10 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |

@@ -3,8 +3,14 @@
 
 用法：
 
-    python3 deploy/triage.py runs/<批次>            # 人类可读
-    python3 deploy/triage.py runs/<批次> --json     # 机器可读（给 CI/告警）
+    python3 deploy/triage.py runs/<批次>                     # 查全部
+    python3 deploy/triage.py runs/<批次> --task arvo:1856     # 只看一个
+    python3 deploy/triage.py runs/<批次> --task arvo:1856 arvo:3736   # 看多个
+    python3 deploy/triage.py runs/<批次> --task-file list.txt # 从文件读任务列表
+    python3 deploy/triage.py runs/<批次> --task arvo:1856 --log-errors --transcript-tail 30   # 深挖
+    python3 deploy/triage.py runs/<批次> --json             # 机器可读（给 CI/告警）
+
+--task 可传 task_id（arvo:1856）或 slug（arvo_1856）。不传 --task 就是查全部。
 
 只读文件，不改任何东西，也不启动容器。批次跑完后、进程被杀后都可以跑。
 """
@@ -97,6 +103,121 @@ def human_size(num: int) -> str:
     if num >= 1024:
         return f"{num / 1024:.1f} KB"
     return f"{num} B"
+
+
+# --log-errors 抽取用。关键约束：只认**日志行**（带时间戳前缀）。
+# agent.log 里混着大量工具输出（源码、编译日志），宽松匹配会命中
+# 源码里的 ERROR_SUCCESS / failed 之类，全是噪音。
+LOG_LINE_PREFIX = rf"^\d{{4}}-\d{{2}}-\d{{2}}T\S+\s+"
+# ERROR 级：这才是"失败原因"。WARN 单独放，因为引擎会把
+# "model_messages is missing" 这类无害提示每个 turn 都刷一遍。
+LOG_ERROR_PATTERNS = (
+    ("level", re.compile(LOG_LINE_PREFIX + r"(?:ERROR|FATAL)")),
+    (
+        "error_code",
+        re.compile(
+            LOG_LINE_PREFIX
+            + r".*(?:error code|error\.code)\s*[:=]\s*\d{3}",
+            re.I,
+        ),
+    ),
+    (
+        "exception",
+        re.compile(
+            LOG_LINE_PREFIX
+            + r".*(?:AuthenticationError|ServiceUnavailableError|RateLimitError|Traceback)",
+        ),
+    ),
+)
+LOG_WARN_PATTERNS = (("warn_level", re.compile(LOG_LINE_PREFIX + r"WARN")),)
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def tail_text(path: Path, max_bytes: int = 4_000_000) -> str:
+    """只读文件末尾若干字节。agent.log 动辄十几 MB，整读会很慢。"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.read(1)  # 丢掉被截断的半行
+            data = handle.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def grep_with_context(text: str, patterns: tuple, context: int = 2) -> list[str]:
+    """在文本里找命中行，连同前后 context 行一起返回（去重）。"""
+    lines = strip_ansi(text).splitlines()
+    keep: set[int] = set()
+    for index, line in enumerate(lines):
+        if any(pattern.search(line) for _, pattern in patterns):
+            for near in range(max(0, index - context), min(len(lines), index + context + 1)):
+                keep.add(near)
+    return [f"{index + 1}: {lines[index]}" for index in sorted(keep)]
+
+
+SPAN_PREFIX_RE = re.compile(r"^[A-Za-z_][\w.]*\{[^{}]*\}\s*:?\s*")
+LEVEL_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\S+)\s+"
+    r"(ERROR|WARN|FATAL|INFO|DEBUG|TRACE)\s+"
+)
+
+
+def compact_log_line(line: str) -> str:
+    """压掉 span 前缀（session_loop{...}:turn{...}:），只留时间、级别、消息。"""
+    match = LEVEL_RE.match(line)
+    if not match:
+        return line
+    stamp, level = match.group(1), match.group(2)
+    rest = line[match.end():]
+    while True:
+        trimmed = SPAN_PREFIX_RE.sub("", rest, count=1)
+        if trimmed == rest:
+            break
+        rest = trimmed
+    return f"{stamp} {level} {rest.strip()}"
+
+
+def dedupe_messages(lines: list[str], limit: int = 40) -> list[str]:
+    """把重复消息合并成一条并标注次数。
+
+    引擎会把同一条 WARN（例如 "model_messages is missing"）每个 turn 刷一遍，
+    一次超时任务能刷出几百行。按"级别 + 消息体"合并后通常只剩几条。
+    """
+    seen: dict[str, tuple[str, int]] = {}
+    order: list[str] = []
+    for raw in lines:
+        number, _, body = raw.partition(": ")
+        compact = compact_log_line(body)
+        match = LEVEL_RE.match(compact)
+        key = compact[match.end():] if match else compact
+        level = match.group(2) if match else ""
+        bucket = f"{level}|{key}"
+        if bucket in seen:
+            first, count = seen[bucket]
+            seen[bucket] = (first, count + 1)
+        else:
+            seen[bucket] = (f"{number}: {compact}", 1)
+            order.append(bucket)
+    merged = []
+    for bucket in order[:limit]:
+        text, count = seen[bucket]
+        merged.append(f"{text}   ×{count}" if count > 1 else text)
+    return merged
+
+
+def tail_lines(text: str, count: int) -> list[str]:
+    if count <= 0:
+        return []
+    lines = [ln for ln in strip_ansi(text).splitlines() if ln.strip()]
+    return [f"{len(lines) - len(tail) + i + 1}: {line}" for i, line in enumerate(tail)] if (tail := lines[-count:]) else []
 
 
 def latest_by_task(records: list[dict]) -> list[dict]:
@@ -238,18 +359,57 @@ def diagnose(record: dict, rows: list[dict], llm: dict, env: dict) -> list[str]:
     return lines
 
 
-def build(batch_dir: Path) -> dict:
+def build(
+    batch_dir: Path,
+    *,
+    task_filter: set[str] | None = None,
+    log_tail: int = 0,
+    log_errors: bool = False,
+    log_warnings: bool = False,
+    transcript_tail: int = 0,
+) -> dict:
     results_path = batch_dir / "results.jsonl"
     records = latest_by_task(read_jsonl(results_path))
     tasks = []
+    wanted = task_filter or set()
+    matched: set[str] = set()
     for record in records:
         slug = record.get("slug") or str(record.get("task_id", "")).replace(":", "_")
+        if wanted and record.get("task_id") not in wanted and slug not in wanted:
+            continue
+        matched.add(record.get("task_id") or "")
+        matched.add(slug)
         task_root = batch_dir / slug
         run_dir = newest_run_dir(task_root)
         rows = stage_rows(run_dir) if run_dir else []
         agent_log = task_root / "agent.log"
         llm = count_patterns(agent_log, LLM_ERROR_PATTERNS)
         env = transcript_errors(run_dir) if run_dir else {}
+
+        # 单任务深挖：agent.log 末尾 / 错误行上下文 / 断点 stage 的 transcript 末尾
+        detail: dict = {}
+        if log_tail or log_errors or log_warnings:
+            text = tail_text(agent_log)
+            if log_tail:
+                detail["log_tail"] = tail_lines(text, log_tail)
+            if log_errors or log_warnings:
+                patterns = LOG_ERROR_PATTERNS + (LOG_WARN_PATTERNS if log_warnings else ())
+                raw_hits = grep_with_context(text, patterns, context=0)
+                detail["log_errors_total"] = len(raw_hits)
+                detail["log_errors"] = dedupe_messages(raw_hits)
+        if transcript_tail and rows:
+            breakpoint_stage = next(
+                (
+                    r["stage"]
+                    for r in rows
+                    if str(r["status"]).lower() in ("running", "active")
+                ),
+                rows[-1]["stage"],
+            )
+            text = tail_text(run_dir / breakpoint_stage / "transcript.md", 2_000_000)
+            detail["breakpoint_stage"] = breakpoint_stage
+            detail["transcript_tail"] = tail_lines(text, transcript_tail)
+
         tasks.append(
             {
                 "task_id": record.get("task_id"),
@@ -267,6 +427,7 @@ def build(batch_dir: Path) -> dict:
                 "stages": rows,
                 "llm_errors": {k: v for k, v in llm.items() if v},
                 "env_errors": {k: v for k, v in env.items() if v},
+                "detail": detail,
                 "artifacts": {
                     name: human_size(p.stat().st_size)
                     for name, p in (
@@ -311,8 +472,10 @@ def build(batch_dir: Path) -> dict:
         "batch": str(batch_dir),
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "results_exists": results_path.exists(),
+        "requested": sorted(wanted) if wanted else None,
+        "not_found": sorted(wanted - matched) if wanted else [],
         "tasks": tasks,
-        "orphan_task_dirs": orphans,
+        "orphan_task_dirs": [] if wanted else orphans,
     }
 
 
@@ -324,6 +487,12 @@ def render(data: dict) -> str:
     out.append(f"生成时间：{data['generated_at']}")
     if not data["results_exists"]:
         out.append("!! results.jsonl 不存在 —— 批次可能未启动或进程被外部杀死")
+    if data.get("requested"):
+        out.append(f"查询任务：{', '.join(data['requested'])}")
+        out.append(f"命中 {len(data['tasks'])} 个")
+    if data.get("not_found"):
+        out.append(f"!! 未找到：{', '.join(data['not_found'])}")
+        out.append("   （提示：可传 task_id 如 arvo:1856，或 slug 如 arvo_1856）")
     out.append(line)
 
     for task in data["tasks"]:
@@ -379,6 +548,28 @@ def render(data: dict) -> str:
         for item in task["diagnosis"]:
             out.append(f"      {item}")
 
+        detail = task.get("detail") or {}
+        if detail.get("breakpoint_stage"):
+            out.append("")
+            out.append(f"  [断点 transcript 末尾] stage={detail['breakpoint_stage']}")
+            for ln in detail.get("transcript_tail") or []:
+                out.append(f"      {ln[:200]}")
+        if detail.get("log_errors"):
+            raw = detail.get("log_errors_total", len(detail["log_errors"]))
+            out.append("")
+            out.append(
+                f"  [agent.log 错误行] 原始 {raw} 行，按消息去重后 {len(detail['log_errors'])} 条"
+            )
+            for ln in detail["log_errors"]:
+                number, _, body = ln.partition(": ")
+                out.append(f"      {number}: {body[:300]}")
+        if detail.get("log_tail"):
+            out.append("")
+            out.append("  [agent.log 末尾]")
+            for ln in detail["log_tail"]:
+                number, _, body = ln.partition(": ")
+                out.append(f"      {number}: {compact_log_line(body)[:300]}")
+
     for orphan in data["orphan_task_dirs"]:
         out.append("")
         out.append(f"── {orphan['slug']} " + "─" * 40)
@@ -398,15 +589,50 @@ def render(data: dict) -> str:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="跑批失败排障")
     parser.add_argument("batch", help="批次目录，例如 runs/smoke-107")
+    parser.add_argument(
+        "--task",
+        nargs="+",
+        metavar="TASK",
+        help="只看这些任务（task_id 如 arvo:1856，或 slug 如 arvo_1856）；不传则查全部",
+    )
+    parser.add_argument(
+        "--task-file",
+        metavar="FILE",
+        help="任务列表文件，一行一个（# 开头的行忽略），可与 --task 同时用",
+    )
+    parser.add_argument("--log-tail", type=int, default=0, metavar="N", help="打印每个任务 agent.log 的末尾 N 行")
+    parser.add_argument("--log-errors", action="store_true", help="打印 agent.log 里的 ERROR/FATAL 行及其上下文")
+    parser.add_argument("--log-warnings", action="store_true", help="连 WARN 行一起打印（引擎有大量无害 WARN，默认不显示）")
+    parser.add_argument("--transcript-tail", type=int, default=0, metavar="N", help="打印断点 stage 的 transcript 末尾 N 行")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args(argv)
+
+    wanted: set[str] = set()
+    for value in args.task or []:
+        wanted.add(value.strip())
+    if args.task_file:
+        task_file = Path(args.task_file).expanduser()
+        if not task_file.is_file():
+            print(f"任务列表文件不存在：{task_file}", file=sys.stderr)
+            return 2
+        for line in task_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                wanted.add(line)
 
     batch_dir = Path(args.batch).expanduser()
     if not batch_dir.is_dir():
         print(f"批次目录不存在：{batch_dir}", file=sys.stderr)
         return 2
 
-    data = build(batch_dir)
+    data = build(
+        batch_dir,
+        task_filter=wanted or None,
+        log_tail=args.log_tail,
+        log_errors=args.log_errors,
+        log_warnings=args.log_warnings,
+        transcript_tail=args.transcript_tail,
+    )
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
