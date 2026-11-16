@@ -10,4 +10,6 @@ tasks/
 .env.*
 report_from_results.sh
 report_from_results.py
+triage.sh
+triage.py
 README.md

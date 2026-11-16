@@ -495,6 +495,28 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 
 断点续跑：**同 `AGENT_ID` + 同 `WORK_ROOT`** 再跑一次，已完成的自动跳过。
 
+### 排障：triage 脚本
+
+某个任务失败了，用 `triage.sh` 一次性看清卡在哪：
+
+```bash
+sh deploy/triage.sh runs/<批次>            # 人类可读
+sh deploy/triage.sh runs/<批次> --json     # 机器可读
+```
+
+它会输出：
+
+- **状态分类**：`results.jsonl` 里每个任务最终状态、agent 状态、耗时、尝试次数、错误原文
+- **阶段进度**：每个 stage 的 `status.json` 状态 + transcript 大小 + 快照是否有效
+  （`runbook.json` 还是 `{}` 占位说明那个 stage 没跑出真实快照，不能作续跑点）
+- **断点**：哪个 stage 处于 `running`
+- **LLM 错误统计**：`agent.log` 里 503/429/401/连接重置的次数——判断是不是内网网关不稳
+- **环境错误**：transcript 里的磁盘满/权限/镜像缺失
+- **findings 摘要**和 **vul/fix 出口码**
+- **孤儿目录**：`results.jsonl` 里没记录、但 state 里还有 run 现场的目录（进程被杀的情况）
+
+只读文件，不启动容器；批次跑完后、进程被杀后都能跑。
+
 ---
 
 ## 10. 部署自检
