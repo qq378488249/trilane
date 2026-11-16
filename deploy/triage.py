@@ -269,26 +269,98 @@ def stage_rows(run_dir: Path) -> list[dict]:
     return rows
 
 
-def count_patterns(path: Path, patterns) -> dict[str, int]:
-    counts = {name: 0 for name, _ in patterns}
+DEFAULT_SCAN_LIMIT_MB = 64
+
+
+def read_window(path: Path, limit_bytes: int) -> tuple[str, int, bool]:
+    """读取文件内容；超过 limit_bytes 时只读末尾。
+
+    返回 (文本, 文件总字节, 是否被截断)。服务器上的 agent.log 可能几百 MB，
+    整读会吃掉同等内存，所以默认走"末尾窗口"。
+    """
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        total = path.stat().st_size
     except OSError:
+        return "", 0, False
+    if limit_bytes <= 0 or total <= limit_bytes:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace"), total, False
+        except OSError:
+            return "", total, False
+    return tail_text(path, limit_bytes), total, True
+
+
+def _variants(needle: str) -> tuple[str, ...]:
+    """常见大小写写法。不做 text.lower()，避免几百 MB 日志再复制一份。"""
+    return tuple({needle, needle.capitalize(), needle.upper()})
+
+
+def _is_word(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch == "_")
+
+
+def _count_literal(text: str, needle: str, word_bounded: bool) -> int:
+    r"""字面量计数，用 str.find（C 实现）。
+
+    比正则快两个数量级：64MB 窗口下 `\b503\b` 要 1.5s，str.find 约 0.01s。
+    word_bounded=True 时要求两侧都不是 \w（字母/数字/下划线），等价于正则的 \b，
+    否则时间戳里的 `.401Z` 会被当成 401。
+    """
+    total = 0
+    start = 0
+    size = len(needle)
+    while True:
+        index = text.find(needle, start)
+        if index < 0:
+            return total
+        if word_bounded:
+            before = text[index - 1] if index > 0 else ""
+            after = text[index + size] if index + size < len(text) else ""
+            if _is_word(before) or _is_word(after):
+                start = index + size
+                continue
+        total += 1
+        start = index + size
+
+
+# 网关错误用字面量统计（不用正则，见 _count_literal 的说明）。
+# 大小写按日志里的实际写法：短语是小写，ECONNRESET 是大写。
+LLM_LITERALS = (
+    ("401", ("401",), True),
+    ("429", ("429",), True),
+    ("503", ("503",), True),
+    # 排除 503：它单独成桶，否则会被重复计数（原正则交替式里 503 优先命中）
+    ("5xx", tuple(str(code) for code in range(500, 510) if code != 503), True),
+    ("conn_reset", _variants("connection reset") + ("ECONNRESET",), False),
+    (
+        "timeout",
+        _variants("timeout") + _variants("timed out") + _variants("time out") + ("timedout", "Timedout", "TIMEDOUT"),
+        False,
+    ),
+    ("rate_limit", _variants("rate limit") + _variants("rate-limit") + _variants("rate_limit"), False),
+)
+
+
+def count_llm_errors(path: Path, limit_bytes: int = 0) -> dict[str, int]:
+    counts = {name: 0 for name, _, _ in LLM_LITERALS}
+    text, _, _ = read_window(path, limit_bytes)
+    if not text:
         return counts
-    for name, pattern in patterns:
-        counts[name] = len(pattern.findall(text))
+    for name, needles, word_bounded in LLM_LITERALS:
+        counts[name] = sum(
+            _count_literal(text, needle, word_bounded) for needle in needles
+        )
     return counts
 
 
-def transcript_errors(run_dir: Path) -> dict[str, int]:
+def transcript_errors(run_dir: Path, limit_bytes: int = 0) -> dict[str, int]:
     counts = {name: 0 for name, _ in ENV_ERROR_PATTERNS}
     for stage in STAGE_IDS:
         transcript = run_dir / stage / "transcript.md"
         if not transcript.exists():
             continue
-        try:
-            text = transcript.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text, _, _ = read_window(transcript, limit_bytes)
+        if not text:
             continue
         for name, pattern in ENV_ERROR_PATTERNS:
             counts[name] += len(pattern.findall(text))
@@ -367,6 +439,7 @@ def build(
     log_errors: bool = False,
     log_warnings: bool = False,
     transcript_tail: int = 0,
+    scan_limit_bytes: int = DEFAULT_SCAN_LIMIT_MB * 1024 * 1024,
 ) -> dict:
     results_path = batch_dir / "results.jsonl"
     records = latest_by_task(read_jsonl(results_path))
@@ -383,13 +456,18 @@ def build(
         run_dir = newest_run_dir(task_root)
         rows = stage_rows(run_dir) if run_dir else []
         agent_log = task_root / "agent.log"
-        llm = count_patterns(agent_log, LLM_ERROR_PATTERNS)
-        env = transcript_errors(run_dir) if run_dir else {}
+        llm = count_llm_errors(agent_log, scan_limit_bytes)
+        env = transcript_errors(run_dir, scan_limit_bytes) if run_dir else {}
+        try:
+            log_bytes = agent_log.stat().st_size
+        except OSError:
+            log_bytes = 0
 
         # 单任务深挖：agent.log 末尾 / 错误行上下文 / 断点 stage 的 transcript 末尾
         detail: dict = {}
         if log_tail or log_errors or log_warnings:
-            text = tail_text(agent_log)
+            # 和计数用同一个窗口，避免几百 MB 的日志整读
+            text, _, _ = read_window(agent_log, scan_limit_bytes)
             if log_tail:
                 detail["log_tail"] = tail_lines(text, log_tail)
             if log_errors or log_warnings:
@@ -425,6 +503,7 @@ def build(
                 "findings_count": record.get("findings_count"),
                 "run_id": run_dir.name if run_dir else None,
                 "stages": rows,
+                "log_bytes": log_bytes,
                 "llm_errors": {k: v for k, v in llm.items() if v},
                 "env_errors": {k: v for k, v in env.items() if v},
                 "detail": detail,
@@ -472,6 +551,7 @@ def build(
         "batch": str(batch_dir),
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "results_exists": results_path.exists(),
+        "scan_limit_bytes": scan_limit_bytes,
         "requested": sorted(wanted) if wanted else None,
         "not_found": sorted(wanted - matched) if wanted else [],
         "tasks": tasks,
@@ -529,6 +609,13 @@ def render(data: dict) -> str:
         if task["llm_errors"]:
             detail = "，".join(f"{k}×{v}" for k, v in task["llm_errors"].items())
             out.append(f"  [LLM 错误] agent.log：{detail}")
+        limit = data.get("scan_limit_bytes") or 0
+        log_bytes = task.get("log_bytes") or 0
+        if limit and log_bytes > limit:
+            out.append(
+                f"  [注] agent.log {human_size(log_bytes)}，统计只覆盖末尾 "
+                f"{human_size(limit)}（可用 --scan-limit 调整）"
+            )
         if task["env_errors"]:
             detail = "，".join(f"{k}×{v}" for k, v in task["env_errors"].items())
             out.append(f"  [环境错误] transcript：{detail}")
@@ -604,6 +691,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--log-errors", action="store_true", help="打印 agent.log 里的 ERROR/FATAL 行及其上下文")
     parser.add_argument("--log-warnings", action="store_true", help="连 WARN 行一起打印（引擎有大量无害 WARN，默认不显示）")
     parser.add_argument("--transcript-tail", type=int, default=0, metavar="N", help="打印断点 stage 的 transcript 末尾 N 行")
+    parser.add_argument(
+        "--scan-limit",
+        type=int,
+        default=DEFAULT_SCAN_LIMIT_MB,
+        metavar="MB",
+        help=f"统计日志时最多扫描末尾多少 MB（0 = 全文）；默认 {DEFAULT_SCAN_LIMIT_MB}",
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args(argv)
 
@@ -631,6 +725,7 @@ def main(argv: list[str]) -> int:
         log_tail=args.log_tail,
         log_errors=args.log_errors,
         log_warnings=args.log_warnings,
+        scan_limit_bytes=args.scan_limit * 1024 * 1024,
         transcript_tail=args.transcript_tail,
     )
     if args.json:

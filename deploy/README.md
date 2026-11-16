@@ -36,7 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.10，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.11，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
@@ -75,8 +75,8 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.10），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.10.tgz` | 71MB | 同上，带版本号的副本 |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.11），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.11.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
@@ -127,7 +127,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.10 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.11 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -233,7 +233,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.10 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.11 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -242,13 +242,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.10 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.10 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.11 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.10 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.11 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -381,7 +381,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.10 \
+  trilane-batch-runner:1.0.11 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -397,7 +397,7 @@ docker run -d --name trilane-batch-1 \
   -v /var/lib/trilane:/var/lib/trilane \
   -v /root/.trilane:/root/.trilane:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.10 \
+  trilane-batch-runner:1.0.11 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -538,6 +538,17 @@ sh deploy/triage.sh runs/<批次> --task arvo:1856 \
 去重效果示例：某次超时任务的 78 行 WARN/ERROR，合并后只剩 14 条，其中能直接看到
 `stream disconnected - retrying sampling request (1/10 in 186ms)` 这种关键信号。
 
+**大日志**：服务器上的 `agent.log` 可能几百 MB。默认只统计**末尾 64MB**（`--scan-limit MB`
+可调，`0` = 全文），并在输出里标注实际扫描范围。实测 307MB 日志：
+
+| 模式 | 耗时 | 峰值内存 |
+| --- | --- | --- |
+| 默认 64MB 窗口 | ~1.0s | 128MB |
+| `--scan-limit 0`（全文） | ~5.8s | 615MB |
+
+计数用字面量匹配而非正则：64MB 窗口下 `\b503\b` 要 1.5s，`str.find` 只要 0.01s，
+口径与原来一致（同样排除 `1503`、时间戳里的 `.401Z` 这类）。
+
 它会输出：
 
 - **状态分类**：`results.jsonl` 里每个任务最终状态、agent 状态、耗时、尝试次数、错误原文
@@ -565,7 +576,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.10 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.11 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
