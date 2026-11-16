@@ -1,0 +1,13 @@
+# 构建上下文只该有 cybergym_batch.py；其余都排除，避免把镜像包（320MB+）
+# 送进 daemon。仓库根的 .dockerignore 不作用于以 deploy/ 为上下文的构建。
+images/
+tests/
+__pycache__/
+*.pyc
+mock-llm/
+tasks/
+.env
+.env.*
+report_from_results.sh
+report_from_results.py
+README.md

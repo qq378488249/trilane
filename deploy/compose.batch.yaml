@@ -76,6 +76,12 @@ x-batch-args: &batch-args
   - "${TASK_TIMEOUT_SEC:-14400}"
   - --agent-retries
   - "${AGENT_RETRIES:-1}"
+  # 超时后从上次的 stage 续跑（off / timeout / always）
+  - --resume
+  - ${RESUME:-timeout}
+  # 单任务累计墙钟上限（秒），0 = 不限
+  - --task-wall-clock-sec
+  - "${TASK_WALL_CLOCK_SEC:-0}"
   - --max-submits
   - "${MAX_SUBMITS:-3}"
   - --verify-rounds

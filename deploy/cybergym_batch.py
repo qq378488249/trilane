@@ -545,6 +545,150 @@ def prepare_state_dir(task_root: Path, trilane_home: Path) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# 撞墙钟超时后的阶段续跑
+# --------------------------------------------------------------------------- #
+#
+# 引擎在每个 stage 目录落盘 runbook.json / status.json，并且支持从指定 stage
+# 续跑（消息首行 `TRILANE_RESUME_RUN% run=<id> stage=<stageN>`）。续跑粒度是
+# **整个 stage**：引擎读 stage(N-1)/runbook.json，删掉 stageN 及之后，重跑。
+#
+# 详细设计与取舍见 docs/task-resume-design.md。
+
+STAGE_IDS = ("stage0", "stage1", "stage2", "stage3", "stage4", "stage5")
+# 引擎侧 safe_run_id 只接受这些字符（transcript_log.rs:439）。
+RESUME_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+RESUME_DIRECTIVE = "TRILANE_RESUME_RUN% run={run_id} stage={stage}"
+
+
+def find_resume_point(task_root: Path, result: dict) -> tuple[str, str] | None:
+    """返回 (run_id, stage_id)；找不到可续跑点返回 None。
+
+    优先级：result.json 的 stages（内层超时路径已落盘）→ 扫 stage 目录
+    （外层强杀路径）。任何一项校验失败都返回 None，调用方据此退回从头跑。
+    """
+    runs_root = task_root / "state" / "trilane" / "runs"
+    if not runs_root.is_dir():
+        return None
+
+    try:
+        run_ids = sorted(
+            (
+                entry.name
+                for entry in runs_root.iterdir()
+                if entry.is_dir() and (entry / "stage0").is_dir()
+            ),
+            reverse=True,  # 目录名带时间戳，字典序即时间序
+        )
+    except OSError:
+        return None
+
+    run_id = next((name for name in run_ids if RESUME_RUN_ID_RE.match(name)), None)
+    if run_id is None:
+        return None
+    run_dir = runs_root / run_id
+
+    stage = _stage_from_result(result) or _stage_from_dirs(run_dir)
+    if stage is None:
+        return None
+    # stage0 是准入阶段，续跑等于从头重做，还会换用带 RESUME_RULES 的提示词。
+    # 直接不续，交给"没有回放点"的分支处理。
+    if stage == "stage0":
+        return None
+
+    # stageN 依赖 stage(N-1)/runbook.json；stage0 依赖自己的。
+    source = STAGE_IDS[max(0, STAGE_IDS.index(stage) - 1)]
+    runbook = run_dir / source / "runbook.json"
+    if not runbook.is_file():
+        return None
+    try:
+        json.loads(runbook.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return run_id, stage
+
+
+def _stage_from_result(result: dict) -> str | None:
+    """从 result.json 的 stages 数组挑回放点。
+
+    StageStatus 序列化为 active / pending / blocked / done（小写）。
+    """
+    stages = result.get("stages")
+    if not isinstance(stages, list):
+        return None
+    by_status: dict[str, list[str]] = {}
+    for item in stages:
+        if not isinstance(item, dict):
+            continue
+        stage_id = item.get("id")
+        status = str(item.get("status") or "").lower()
+        if stage_id in STAGE_IDS:
+            by_status.setdefault(status, []).append(stage_id)
+    for wanted in ("active", "pending", "blocked"):
+        candidates = by_status.get(wanted)
+        if candidates:
+            return min(candidates, key=STAGE_IDS.index)
+    return None
+
+
+def _stage_from_dirs(run_dir: Path) -> str | None:
+    """外层强杀时的兜底：找编号最大的、已有 runbook.json 的 stage。
+
+    该 stage 的 status.json 显示 Completed 时说明它已跑完，退到下一个。
+    """
+    for stage in reversed(STAGE_IDS):
+        stage_dir = run_dir / stage
+        if not (stage_dir / "runbook.json").is_file():
+            continue
+        status = ""
+        try:
+            payload = json.loads(
+                (stage_dir / "status.json").read_text(encoding="utf-8", errors="replace")
+            )
+            status = str(payload.get("status") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+        if status.lower() in ("completed", "done"):
+            next_index = STAGE_IDS.index(stage) + 1
+            return STAGE_IDS[next_index] if next_index < len(STAGE_IDS) else None
+        return stage
+    return None
+
+
+def apply_resume_directive(task_root: Path, run_id: str, stage: str) -> None:
+    """把续跑指令写到 TASK.md 第一行——引擎只认第一个非空行。
+
+    多次重试会重复调用，所以先剥掉开头已注入的指令块，避免叠加。
+    """
+    task_md = task_root / "task" / "TASK.md"
+    body_lines = task_md.read_text(encoding="utf-8", errors="replace").splitlines()
+    while body_lines and (
+        not body_lines[0].strip() or body_lines[0].startswith("TRILANE_RESUME_RUN%")
+    ):
+        body_lines.pop(0)
+    directive = RESUME_DIRECTIVE.format(run_id=run_id, stage=stage)
+    task_md.write_text(
+        "\n".join([directive, "", *body_lines]) + "\n", encoding="utf-8"
+    )
+
+
+def archive_attempt_outputs(task_root: Path, attempt: int) -> None:
+    """隔离上一次的 result.json / report.md。
+
+    外层强杀时引擎没机会重写 result.json，run_agent 会把旧文件当成本次结果
+    读走，导致状态误判。
+    """
+    out_dir = task_root / "out"
+    for name in ("result.json", "report.md", "agent.log"):
+        source = out_dir / name
+        if source.exists():
+            try:
+                source.replace(out_dir / f"{name}.attempt{attempt}")
+            except OSError:
+                # 隔离失败不致命：退化为可能读到旧结果，但不阻断跑批。
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # 跑智能体
 # --------------------------------------------------------------------------- #
 
@@ -1186,19 +1330,84 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         prepare_state_dir(task_root, Path(args.trilane_home).expanduser())
 
         log(f"[{task.task_id}] 启动智能体（超时 {args.timeout_sec}s）")
+        resume_log: list[dict] = []
+        # 进程被重启（compose down/up、宿主重启、手动重跑）时，results.jsonl 里
+        # 可能根本没有这条记录，重试循环不会触发。这里在**首轮之前**也查一次
+        # 回放点，让手动重启同样能接着上次的 stage 跑。
+        if args.resume != "off":
+            point = find_resume_point(task_root, {})
+            if point is not None:
+                run_id, stage = point
+                archive_attempt_outputs(task_root, 0)
+                apply_resume_directive(task_root, run_id, stage)
+                log(f"[{task.task_id}] 检测到上次中断于 {run_id}/{stage}，直接续跑")
+                resume_log.append(
+                    {
+                        "attempt": 1,
+                        "run_id": run_id,
+                        "from_stage": stage,
+                        "previous_status": "interrupted",
+                    }
+                )
         outcome = run_agent(task, task_root, args)
+        if resume_log:
+            resume_log[-1]["outcome"] = outcome.status
         attempts = 1
-        # 容器被 OOM 杀掉、runbook 报错这类临时故障重试一次；真超时不重试（会白烧一倍预算）。
-        while (
-            outcome.status in ("container_failed", "error")
-            and attempts < args.agent_retries + 1
-        ):
+        max_attempts = args.agent_retries + 1
+        wall_clock = outcome.duration_sec
+
+        # 容器被 OOM 杀掉、runbook 报错这类临时故障重试；超时在能定位到回放点
+        # 时也重试（从上次的 stage 接着跑，不是从头烧一遍）。
+        while attempts < max_attempts:
+            retryable = outcome.status in ("container_failed", "error")
+            if outcome.status == "timeout" and args.resume != "off":
+                retryable = True
+            if not retryable:
+                break
+
+            point = find_resume_point(task_root, outcome.result) if args.resume != "off" else None
+            # 超时但没有可用的 stage 存档：维持原语义（重跑只会白烧一轮预算）。
+            if outcome.status == "timeout" and point is None:
+                break
+
+            if args.task_wall_clock_sec and wall_clock >= args.task_wall_clock_sec:
+                log(
+                    f"[{task.task_id}] 累计墙钟 {wall_clock:.0f}s 已达上限 "
+                    f"{args.task_wall_clock_sec}s，停止重试"
+                )
+                break
+
             attempts += 1
             wait = 60 * attempts
-            log(f"[{task.task_id}] {outcome.status}（{outcome.detail}），{wait}s 后第 {attempts} 次尝试")
+            if point is not None:
+                run_id, stage = point
+                archive_attempt_outputs(task_root, attempts - 1)
+                apply_resume_directive(task_root, run_id, stage)
+                log(
+                    f"[{task.task_id}] {outcome.status}（{outcome.detail}），"
+                    f"{wait}s 后第 {attempts} 次尝试：从 {run_id}/{stage} 续跑"
+                )
+                resume_log.append(
+                    {
+                        "attempt": attempts,
+                        "run_id": run_id,
+                        "from_stage": stage,
+                        "previous_status": outcome.status,
+                    }
+                )
+            else:
+                log(
+                    f"[{task.task_id}] {outcome.status}（{outcome.detail}），"
+                    f"{wait}s 后第 {attempts} 次尝试（从头跑）"
+                )
             time.sleep(wait)
             outcome = run_agent(task, task_root, args)
+            wall_clock += outcome.duration_sec
+            if resume_log and resume_log[-1]["attempt"] == attempts:
+                resume_log[-1]["outcome"] = outcome.status
+
         record["agent_attempts"] = attempts
+        record["resume_attempts"] = resume_log
         record.update(
             agent_status=outcome.status,
             agent_returncode=outcome.returncode,
@@ -1350,6 +1559,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="DinD 镜像（--isolation dind 时使用）",
     )
     parser.add_argument("--vul-image", default=None, help="覆盖 vul 镜像名（调试用）")
+    parser.add_argument(
+        "--resume",
+        choices=("off", "timeout", "always"),
+        default=os.environ.get("TRILANE_RESUME", "timeout"),
+        help=(
+            "超时/失败后是否从上次 stage 续跑：off=不续跑；"
+            "timeout=仅超时且找到回放点时续跑（默认）；always=任何失败都尽量续跑"
+        ),
+    )
+    parser.add_argument(
+        "--task-wall-clock-sec",
+        type=int,
+        default=int(os.environ.get("TRILANE_TASK_WALL_CLOCK_SEC", "0") or 0),
+        help="单任务累计墙钟上限（秒，含所有重试）；0 = 不限",
+    )
     parser.add_argument("--work-root", default=None, help="工作目录根；默认 runs/cybergym-<时间戳>")
     parser.add_argument(
         "--min-free-gb",
