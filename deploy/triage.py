@@ -217,7 +217,9 @@ def tail_lines(text: str, count: int) -> list[str]:
     if count <= 0:
         return []
     lines = [ln for ln in strip_ansi(text).splitlines() if ln.strip()]
-    return [f"{len(lines) - len(tail) + i + 1}: {line}" for i, line in enumerate(tail)] if (tail := lines[-count:]) else []
+    tail = lines[-count:]
+    offset = len(lines) - len(tail)
+    return [f"{offset + i + 1}: {line}" for i, line in enumerate(tail)]
 
 
 def latest_by_task(records: list[dict]) -> list[dict]:
@@ -270,6 +272,8 @@ def stage_rows(run_dir: Path) -> list[dict]:
 
 
 DEFAULT_SCAN_LIMIT_MB = 64
+# transcript 在这段时间内还有写入，就认为任务还在跑
+RUNNING_WINDOW_SEC = 600
 
 
 def read_window(path: Path, limit_bytes: int) -> tuple[str, int, bool]:
@@ -528,7 +532,8 @@ def build(
             }
         )
 
-    # results.jsonl 里没有的任务：state 目录里可能还有现场
+    # results.jsonl 里没有记录的：可能正在跑，也可能跑完前进程被杀了。
+    # 用 transcript 的最近写入时间区分，免得把正在跑的当成中断现场。
     known = {t["slug"] for t in tasks}
     orphans = []
     if batch_dir.is_dir():
@@ -538,12 +543,29 @@ def build(
             run_dir = newest_run_dir(child)
             if run_dir is None:
                 continue
+            rows = stage_rows(run_dir)
+            newest = max(
+                (
+                    (run_dir / r["stage"] / "transcript.md").stat().st_mtime
+                    for r in rows
+                    if (run_dir / r["stage"] / "transcript.md").exists()
+                ),
+                default=0,
+            )
+            running = (datetime.now().timestamp() - newest) < RUNNING_WINDOW_SEC
             orphans.append(
                 {
                     "slug": child.name,
                     "run_id": run_dir.name,
-                    "stages": stage_rows(run_dir),
-                    "reason": "results.jsonl 里没有记录，但 state 里有 run 现场",
+                    "stages": rows,
+                    "running": running,
+                    "idle_sec": int(datetime.now().timestamp() - newest) if newest else None,
+                    "reason": (
+                        f"正在运行（transcript 最近 {int(datetime.now().timestamp() - newest)}s 前还在写）"
+                        if running
+                        else f"results.jsonl 里没有记录，但 state 里有 run 现场"
+                        f"（最后一次写入 {int(datetime.now().timestamp() - newest)}s 前）"
+                    ),
                 }
             )
 
@@ -667,7 +689,10 @@ def render(data: dict) -> str:
                 f"      {row['stage']:<7} {str(row['status']):<10} "
                 f"transcript={human_size(row['transcript_bytes']):<9} 快照={row['snapshot']}"
             )
-        out.append("      → 重新跑批次时会自动从断点续跑（若快照有效）")
+        if orphan.get("running"):
+            out.append("      → 正在跑：results.jsonl 要等任务结束才会落账，稍后再查")
+        else:
+            out.append("      → 已中断：重新跑批次时会从断点续跑（若快照有效）")
 
     out.append("")
     return "\n".join(out)
