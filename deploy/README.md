@@ -39,7 +39,6 @@
 | `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.9，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
-| `versions/` | — | 历史编排器版本（回滚用），别整目录 load |
 
 暂**不含**目标镜像（`n132/arvo:<id>-vul`，每个 0.5–2GB）和数据集，按 §2 单独打包搬运。
 
@@ -71,8 +70,8 @@ cd deploy
 for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 ```
 
-> `images/` 顶层只有**当前要用的**包；`images/versions/` 里是历史版本（回滚用），
-> **不要**整目录 load，否则会装上一堆旧编排器。
+> `images/` 顶层只有**当前要用的**包。要回滚到旧编排器时，从 git 历史里取对应的
+> `batch-runner.Dockerfile` 重建，或找打包机重新导出——历史镜像包不留在这里。
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
@@ -80,7 +79,6 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 | `images/trilane-batch-runner-1.0.9.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
-| `images/versions/` | — | 历史编排器版本（1.0.4–1.0.8），仅供回滚 |
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
 
