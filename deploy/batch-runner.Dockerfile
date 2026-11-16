@@ -34,6 +34,10 @@ COPY --from=docker.1ms.run/library/docker:cli /usr/local/bin/docker /usr/local/b
 
 WORKDIR /opt/trilane-batch
 COPY cybergym_batch.py /opt/trilane-batch/cybergym_batch.py
+# 排障脚本：批次跑完后对 runs/<批次>/ 做失败分析。
+# 用法：docker run --rm --entrypoint python3 -v <work-root>:/host_mnt/... \
+#          trilane-batch-runner python3 /opt/trilane-batch/triage.py /host_mnt/.../runs/<批次>
+COPY triage.py triage.sh /opt/trilane-batch/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

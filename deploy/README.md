@@ -24,6 +24,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `cybergym_batch.py` | 跑批脚本本体（取任务包 → 生成提示词 → 跑 TriLane → 提交 PoC） |
+| `triage.py` / `triage.sh` | 失败排障：对 `runs/<批次>/` 输出状态分类、阶段进度、断点、错误统计、结论 |
 | `batch-runner.Dockerfile` | 编排器镜像，把上面的脚本烤进去 |
 | `compose.batch.yaml` | 推荐方式：compose 编排（`network_mode: host` + 同路径挂载） |
 | `.env.example` | 配置模板，复制成 `.env` 后填 |
@@ -35,8 +36,10 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器，内含最新 `cybergym_batch.py` |
-| `trilane-headless.tgz` | 292MB | 智能体本体 |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.9，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
+| `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
+| `versions/` | — | 历史编排器版本（回滚用），别整目录 load |
 
 暂**不含**目标镜像（`n132/arvo:<id>-vul`，每个 0.5–2GB）和数据集，按 §2 单独打包搬运。
 
@@ -62,8 +65,22 @@
 
 ```bash
 cd deploy
+# 先校验（可选，但推荐）
+(cd images && sha256sum -c SHA256SUMS)
+
 for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 ```
+
+> `images/` 顶层只有**当前要用的**包；`images/versions/` 里是历史版本（回滚用），
+> **不要**整目录 load，否则会装上一堆旧编排器。
+
+| 包 | 大小 | 内容 |
+| --- | --- | --- |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.9），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.9.tgz` | 71MB | 同上，带版本号的副本 |
+| `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
+| `images/SHA256SUMS` | — | 上面几个包的校验和 |
+| `images/versions/` | — | 历史编排器版本（1.0.4–1.0.8），仅供回滚 |
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
 
@@ -112,7 +129,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.1 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.9 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -218,7 +235,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.1 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.9 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -227,13 +244,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.1 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.1 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.9 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.1 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.9 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -366,7 +383,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.1 \
+  trilane-batch-runner:1.0.9 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -382,7 +399,7 @@ docker run -d --name trilane-batch-1 \
   -v /var/lib/trilane:/var/lib/trilane \
   -v /root/.trilane:/root/.trilane:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.1 \
+  trilane-batch-runner:1.0.9 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -517,13 +534,21 @@ sh deploy/triage.sh runs/<批次> --json     # 机器可读
 
 只读文件，不启动容器；批次跑完后、进程被杀后都能跑。
 
+服务器上如果只有镜像包（没带 `deploy/` 目录），可以直接用镜像里的那份：
+
+```bash
+docker run --rm --entrypoint python3 \
+  -v /var/lib/trilane:/host_mnt/work \
+  trilane-batch-runner python3 /opt/trilane-batch/triage.py /host_mnt/work/runs/<批次>
+```
+
 ---
 
 ## 10. 部署自检
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.1 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.9 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
