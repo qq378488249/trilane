@@ -560,6 +560,46 @@ RESUME_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RESUME_DIRECTIVE = "TRILANE_RESUME_RUN% run={run_id} stage={stage}"
 
 
+def _valid_runbook(stage_dir: Path) -> dict | None:
+    """读取并校验一个 stage 的 runbook.json；不是有效快照时返回 None。
+
+    引擎在 run 初始化时会给 6 个 stage 都写一份 `{}` 占位
+    （transcript_log.rs:251 write_stage_header），真实快照要等 turn 结束才覆盖。
+    `RunbookState` 的 status/objective/stages 等字段没有 serde default，`{}` 根本
+    解析不了，引擎侧 load_resume_state 会直接返回 parse 错误。所以这里必须把
+    占位文件排除，否则会选到一个无法恢复的 stage。
+    """
+    path = stage_dir / "runbook.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # 占位 "{}" 没有任何字段；真实快照至少有 objective 和 stages（后者可以是空数组）。
+    if "objective" not in payload or "stages" not in payload:
+        return None
+    if not isinstance(payload.get("objective"), str) or not payload["objective"].strip():
+        return None
+    if not isinstance(payload.get("stages"), list):
+        return None
+    return payload
+
+
+def _last_result(task_root: Path) -> dict:
+    """读上一次尝试的 out/result.json（可能不存在或损坏）。"""
+    path = task_root / "out" / "result.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def find_resume_point(task_root: Path, result: dict) -> tuple[str, str] | None:
     """返回 (run_id, stage_id)；找不到可续跑点返回 None。
 
@@ -597,12 +637,7 @@ def find_resume_point(task_root: Path, result: dict) -> tuple[str, str] | None:
 
     # stageN 依赖 stage(N-1)/runbook.json；stage0 依赖自己的。
     source = STAGE_IDS[max(0, STAGE_IDS.index(stage) - 1)]
-    runbook = run_dir / source / "runbook.json"
-    if not runbook.is_file():
-        return None
-    try:
-        json.loads(runbook.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+    if _valid_runbook(run_dir / source) is None:
         return None
     return run_id, stage
 
@@ -631,13 +666,14 @@ def _stage_from_result(result: dict) -> str | None:
 
 
 def _stage_from_dirs(run_dir: Path) -> str | None:
-    """外层强杀时的兜底：找编号最大的、已有 runbook.json 的 stage。
+    """外层强杀时的兜底：找编号最大的、有**有效** runbook 快照的 stage。
 
-    该 stage 的 status.json 显示 Completed 时说明它已跑完，退到下一个。
+    占位 `{}` 不算（见 _valid_runbook）。该 stage 的 status.json 显示
+    Completed 时说明它已跑完，退到下一个。
     """
     for stage in reversed(STAGE_IDS):
         stage_dir = run_dir / stage
-        if not (stage_dir / "runbook.json").is_file():
+        if _valid_runbook(stage_dir) is None:
             continue
         status = ""
         try:
@@ -909,11 +945,14 @@ def run_agent_in_dind(
             env=dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*"),
         )
         try:
-            # 比容器内超时多留 10 分钟：给 TriLane 落盘 result.json 的时间
-            proc.wait(timeout=args.timeout_sec + 600)
+            # 引擎内层超时 (--headless-timeout-sec) 会自己写 result.json 并 exit 3。
+            # 这里多等 120s 给它落盘；落盘成功后 proc.wait 会立刻返回。
+            proc.wait(timeout=args.timeout_sec + 120)
             return proc.returncode
         except subprocess.TimeoutExpired:
-            # 容器在 dind 里，必须让 dind 去杀；宿主看不到它。
+            # 引擎没在 120s 内退出（可能卡在 LLM 流式或 run_poc），
+            # 先给它 30s 让 write_headless_result 写完，再强杀。
+            time.sleep(30)
             run(["docker", "exec", handle.name, "docker", "rm", "-f", container], timeout=120)
             try:
                 proc.wait(timeout=120)
@@ -1054,7 +1093,10 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
     finally:
         if dind is not None:
             log(f"[{task.task_id}] 清理 DinD {dind.name}")
-            stop_dind(dind)
+            try:
+                stop_dind(dind)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[{task.task_id}] 清理 DinD 失败（不致命）：{exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1335,7 +1377,8 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         # 可能根本没有这条记录，重试循环不会触发。这里在**首轮之前**也查一次
         # 回放点，让手动重启同样能接着上次的 stage 跑。
         if args.resume != "off":
-            point = find_resume_point(task_root, {})
+            # 带上上次的 result.json：它记录了各 stage 的状态，比只看目录可靠。
+            point = find_resume_point(task_root, _last_result(task_root))
             if point is not None:
                 run_id, stage = point
                 archive_attempt_outputs(task_root, 0)

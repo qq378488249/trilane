@@ -21,15 +21,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cybergym_batch as cb  # noqa: E402
 
 
+def _snapshot(stage: str = "stage2") -> str:
+    """引擎真实写出的 runbook 快照（占位 `{}` 不算，见 _valid_runbook）。"""
+    return json.dumps(
+        {"objective": "# obj", "current_stage": stage, "stages": [], "status": "Running"}
+    )
+
+
 def make_run(root: Path, stages, status: str = "Running", run_id: str = "trilane-20261115-161706") -> Path:
     """在 <root>/runs/<run_id>/ 下铺 stage 目录。root 指 state/trilane。"""
     run_dir = root / "runs" / run_id
     for stage in stages:
         d = run_dir / stage
         d.mkdir(parents=True)
-        (d / "runbook.json").write_text(
-            json.dumps({"current_stage": stage}), encoding="utf-8"
-        )
+        (d / "runbook.json").write_text(_snapshot(stage), encoding="utf-8")
         (d / "status.json").write_text(
             json.dumps({"status": status}), encoding="utf-8"
         )
@@ -119,6 +124,43 @@ class FindResumePointTests(unittest.TestCase):
             cb.find_resume_point(
                 self.root, {"stages": [{"id": "stage0", "status": "active"}]}
             )
+        )
+
+    def test_placeholder_runbook_is_ignored(self):
+        """引擎初始化写的 `{}` 占位不是有效快照，不能被当成回放点。"""
+        run_dir = self.state / "runs" / "trilane-20261116-043754"
+        for stage in cb.STAGE_IDS:
+            d = run_dir / stage
+            d.mkdir(parents=True)
+            (d / "runbook.json").write_text("{}", encoding="utf-8")
+            (d / "status.json").write_text(
+                json.dumps({"status": "pending"}), encoding="utf-8"
+            )
+        self.assertIsNone(cb.find_resume_point(self.root, {}))
+
+    def test_partial_placeholders_still_resume(self):
+        """只有部分 stage 有真快照时，取最高的那个有效 stage。"""
+        run_dir = self.state / "runs" / "trilane-20261116-043754"
+        for stage in cb.STAGE_IDS:
+            d = run_dir / stage
+            d.mkdir(parents=True)
+            (d / "runbook.json").write_text("{}", encoding="utf-8")
+            (d / "status.json").write_text(
+                json.dumps({"status": "pending"}), encoding="utf-8"
+            )
+        # 真实场景：跑过的 stage 有快照，没跑到的仍是占位。
+        # 续跑 stageN 依赖 stage(N-1) 的快照，所以 stage0/1 也必须是真快照。
+        for stage in ("stage0", "stage1", "stage2"):
+            (run_dir / stage / "runbook.json").write_text(
+                _snapshot(stage), encoding="utf-8"
+            )
+            (run_dir / stage / "status.json").write_text(
+                json.dumps({"status": "Completed" if stage != "stage2" else "Running"}),
+                encoding="utf-8",
+            )
+        self.assertEqual(
+            cb.find_resume_point(self.root, {}),
+            ("trilane-20261116-043754", "stage2"),
         )
 
     def test_stage1_is_resumable(self):
@@ -256,7 +298,7 @@ class RunOneRetryTests(unittest.TestCase):
             for stage in ("stage0", "stage1", "stage2"):
                 d = run_dir / stage
                 d.mkdir(parents=True, exist_ok=True)
-                (d / "runbook.json").write_text("{}", encoding="utf-8")
+                (d / "runbook.json").write_text(_snapshot(), encoding="utf-8")
                 (d / "status.json").write_text(
                     json.dumps({"status": "Running"}), encoding="utf-8"
                 )
@@ -338,7 +380,7 @@ class RunOneRetryTests(unittest.TestCase):
             for stage in ("stage0", "stage1", "stage2"):
                 d = run_dir / stage
                 d.mkdir(parents=True, exist_ok=True)
-                (d / "runbook.json").write_text("{}", encoding="utf-8")
+                (d / "runbook.json").write_text(_snapshot(), encoding="utf-8")
                 (d / "status.json").write_text(
                     json.dumps({"status": "Running"}), encoding="utf-8"
                 )
@@ -373,7 +415,7 @@ class RunOneRetryTests(unittest.TestCase):
         for stage in ("stage0", "stage1", "stage2"):
             d = run_dir / stage
             d.mkdir(parents=True)
-            (d / "runbook.json").write_text("{}", encoding="utf-8")
+            (d / "runbook.json").write_text(_snapshot(), encoding="utf-8")
             (d / "status.json").write_text(
                 json.dumps({"status": "Running"}), encoding="utf-8"
             )
@@ -412,6 +454,53 @@ class RunOneRetryTests(unittest.TestCase):
             record["resume_attempts"][0]["previous_status"], "interrupted"
         )
         self.assertEqual(record["resume_attempts"][0]["outcome"], "completed")
+
+    def test_first_probe_ignores_stage0_active(self):
+        """result.json 显示 stage0 时（只跑了个开头），首轮不该续跑。"""
+        self._seed_interrupted_run()
+        out = self.work_root / "arvo_3938" / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "result.json").write_text(
+            json.dumps({"status": "timeout",
+                        "stages": [{"id": "stage0", "status": "active"},
+                                   {"id": "stage1", "status": "pending"}]}),
+            encoding="utf-8",
+        )
+        calls = {"n": 0}
+        record = self._run(
+            self._args(resume="timeout", agent_retries=1),
+            self._first_directive_agent(calls),
+        )
+        self.assertFalse(calls["directive"].startswith("TRILANE_RESUME_RUN%"))
+        self.assertEqual(record["resume_attempts"], [])
+
+    def test_first_probe_uses_result_json_stage(self):
+        """result.json 指向 stage3 时，首轮从 stage3 续跑。"""
+        self._seed_interrupted_run()
+        # 让 stage3 也有有效快照（向上找时会被选中）
+        run_dir = (self.work_root / "arvo_3938" / "state" / "trilane"
+                   / "runs" / "trilane-20261115-161706")
+        d3 = run_dir / "stage3"
+        d3.mkdir(parents=True, exist_ok=True)
+        (d3 / "runbook.json").write_text(_snapshot("stage3"), encoding="utf-8")
+        (d3 / "status.json").write_text(json.dumps({"status": "Running"}), encoding="utf-8")
+        out = self.work_root / "arvo_3938" / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "result.json").write_text(
+            json.dumps({"status": "timeout",
+                        "stages": [{"id": "stage3", "status": "active"},
+                                   {"id": "stage4", "status": "pending"}]}),
+            encoding="utf-8",
+        )
+        calls = {"n": 0}
+        self._run(
+            self._args(resume="timeout", agent_retries=1),
+            self._first_directive_agent(calls),
+        )
+        self.assertEqual(
+            calls["directive"],
+            "TRILANE_RESUME_RUN% run=trilane-20261115-161706 stage=stage3",
+        )
 
     def test_restart_does_not_resume_when_off(self):
         self._seed_interrupted_run()

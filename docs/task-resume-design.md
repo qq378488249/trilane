@@ -201,9 +201,12 @@ while (
 
 - 目标 stage **不能是 `stage0`**（准入阶段续跑等于从头重做，且会换用带
   `RESUME_RULES` 的提示词）；
-- 目标 stage 的**前一个 stage** 必须存在 `runbook.json`
+- 目标 stage 的**前一个 stage** 必须存在**有效** `runbook.json`
   （`stageN` 依赖 `stage(N-1)/runbook.json`；`stage0` 依赖自己的）；
-- `runbook.json` 能被 `json.loads` 解析；
+- **`runbook.json` 不能是 `{}` 占位**：引擎初始化时给 6 个 stage 都写
+  `{}`（`transcript_log.rs:251`），真实快照才有 `objective` / `stages`；
+  占位文件引擎自己也解析不了（`RunbookState` 的字段没有 serde default）；
+- **首轮探测**（进程重启场景）读 `out/result.json` 的 stages，而不是传空 dict：
 - `run_id` 通过字符集校验。
 
 ### 3.3 指令注入
@@ -308,13 +311,25 @@ def find_resume_point(task_root: Path, result: dict) -> tuple[str, str] | None:
     idx = STAGE_IDS.index(stage)
     source = STAGE_IDS[max(0, idx - 1)]
     runbook = run_dir / source / "runbook.json"
-    if not runbook.is_file():
-        return None
-    try:
-        json.loads(runbook.read_text(encoding="utf-8"))
-    except Exception:
+    if _valid_runbook(run_dir / source) is None:
         return None
     return run_id, stage
+
+
+def _valid_runbook(stage_dir: Path) -> dict | None:
+    """排除引擎初始化写的 "{}" 占位：真实快照至少有 objective 和 stages。"""
+    path = stage_dir / "runbook.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "objective" not in payload or "stages" not in payload:
+        return None
+    return payload
 
 
 def _stage_from_result(result: dict) -> str | None:
