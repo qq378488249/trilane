@@ -789,9 +789,15 @@ def detect_disk_space_error(
         return None
     for path in paths:
         try:
-            if path.stat().st_mtime < since_epoch:
+            stat = path.stat()
+            if stat.st_mtime < since_epoch:
                 continue
             offset = sizes.get(path, 0)
+            # 续跑时引擎会删掉 stageN 及之后重建，新文件比旧文件小得多。
+            # 偏移量一旦越过文件尾，seek 之后读到的是空内容——真实的 ENOSPC
+            # 会被漏掉。变小就说明不是同一个文件了，从头扫。
+            if stat.st_size < offset:
+                offset = 0
             with path.open("rb") as handle:
                 handle.seek(offset)
                 chunk = handle.read()

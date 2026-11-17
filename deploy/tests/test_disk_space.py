@@ -80,6 +80,25 @@ class DiskSpaceDetectionTests(unittest.TestCase):
         sizes = cb.snapshot_transcript_sizes(self.state)
         self.assertIsNone(cb.detect_disk_space_error(self.state, self.since, sizes))
 
+    def test_recreated_smaller_file_is_scanned_from_start(self):
+        """续跑时引擎删掉 stage 重建，新文件比旧的小——不能拿旧偏移跳过真实错误。
+
+        这条是最初修复漏掉的情况：seek(旧偏移) 越过文件尾，读到空内容，
+        真实的 ENOSPC 被静默漏掉。
+        """
+        write_transcript(self.transcript, "x" * 5000)
+        sizes = cb.snapshot_transcript_sizes(self.state)
+        self.assertEqual(sizes[self.transcript], 5000)
+
+        # 模拟续跑：文件被删掉重建，变小，随后真的写入了 ENOSPC
+        self.transcript.unlink()
+        content = "# recreated" + chr(10) + ENOSPC + chr(10)
+        write_transcript(self.transcript, content)
+
+        found = cb.detect_disk_space_error(self.state, self.since, sizes)
+        self.assertIsNotNone(found, "重建后的文件必须从头扫，否则会漏报")
+        self.assertIn("no space left on device", found)
+
     def test_snapshot_returns_sizes(self):
         write_transcript(self.transcript, "abc")
         sizes = cb.snapshot_transcript_sizes(self.state)
