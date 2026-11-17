@@ -745,12 +745,40 @@ class DindHandle:
     run_volume: str
 
 
-def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
+def snapshot_transcript_sizes(state_dir: Path) -> dict[Path, int]:
+    """记录本轮开始时各 transcript 的字节数，供 detect_disk_space_error 只扫新增部分。
+
+    transcript 跨尝试**追加**写入：如果按文件 mtime 过滤，第二次尝试会让整个文件
+    （含上一次的 ENOSPC 行）重新进入扫描范围，磁盘清干净了也照样报 disk_space。
+    """
+    sizes: dict[Path, int] = {}
+    try:
+        paths = list(state_dir.rglob("transcript.md"))
+    except OSError:
+        return sizes
+    for path in paths:
+        try:
+            sizes[path] = path.stat().st_size
+        except OSError:
+            continue
+    return sizes
+
+
+def detect_disk_space_error(
+    state_dir: Path, since_epoch: float, sizes: dict[Path, int] | None = None
+) -> str | None:
     """在本轮 transcript 里找 "no space left on device"。
 
     工具输出只进 transcript，不进 agent.log，所以扫 stage*/transcript.md。
-    只认本轮开始后修改过的文件，避免上一次尝试的磁盘错误把这次重跑误判成磁盘问题。
+
+    两道过滤，缺一不可：
+    1. 文件 mtime 必须晚于本轮开始——排除本轮根本没动过的文件；
+    2. 只读从 `sizes` 里记的偏移量开始的**新增字节**——排除上一次尝试留下的行。
+
+    只有 (1) 不够：transcript 是追加写，mtime 会被本次写入刷新，老的错误行会跟着一起被扫出来。
     """
+    if sizes is None:
+        sizes = {}
     try:
         paths = sorted(
             state_dir.rglob("transcript.md"),
@@ -763,9 +791,13 @@ def detect_disk_space_error(state_dir: Path, since_epoch: float) -> str | None:
         try:
             if path.stat().st_mtime < since_epoch:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            offset = sizes.get(path, 0)
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
         except OSError:
             continue
+        text = chunk.decode("utf-8", errors="replace")
         for line in text.splitlines():
             if DISK_SPACE_RE.search(line):
                 return f"{path}: {line.strip()[:240]}"
@@ -975,6 +1007,9 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
 
     started = time.monotonic()
     started_epoch = time.time()
+    # 先记下各 transcript 当前大小，之后只扫新增部分，避免上一次尝试的
+    # ENOSPC 行被这次重跑重新扫出来（见 snapshot_transcript_sizes）。
+    transcript_sizes = snapshot_transcript_sizes(state_dir)
     dind: DindHandle | None = None
     try:
         if args.isolation == "dind":
@@ -1074,7 +1109,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
 
         # 磁盘不足时绝不自动重试：重试只会让模型再次面对同一块满盘，
         # 历史上正是这个场景触发了全局 docker prune。留给人工处理。
-        disk_error = detect_disk_space_error(state_dir, started_epoch)
+        disk_error = detect_disk_space_error(state_dir, started_epoch, transcript_sizes)
         if disk_error:
             return RunOutcome(
                 "disk_space",
