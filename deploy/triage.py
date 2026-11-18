@@ -38,18 +38,18 @@ LLM_ERROR_PATTERNS = (
 )
 
 # transcript 里的环境类错误（工具输出只进 transcript，不进 agent.log）。
-# 正则要和批次脚本的 DISK_SPACE_RE（cybergym_batch.py:95）一样严——阶段提示词里
-# 本身就写着 "If the environment reports `no space left on device` ..."，宽松匹配会误报。
+# disk_full 统计已停用：阶段提示词本身就写着 "no space left on device"，
+# 模型也会在推理里复述，按文本统计只会误报（runner 侧同样已停用）。
 ENV_ERROR_PATTERNS = (
-    (
-        "disk_full",
-        re.compile(
-            r"(error response from daemon.*no space left on device"
-            r"|no space left on device: unknown"
-            r"|(?:writing|write|mkdir|open|create|copy).*no space left on device)",
-            re.IGNORECASE,
-        ),
-    ),
+    # (
+    #     "disk_full",
+    #     re.compile(
+    #         r"(error response from daemon.*no space left on device"
+    #         r"|no space left on device: unknown"
+    #         r"|(?:writing|write|mkdir|open|create|copy).*no space left on device)",
+    #         re.IGNORECASE,
+    #     ),
+    # ),
     ("permission", re.compile(r"permission denied", re.I)),
     ("conn_refused", re.compile(r"connection refused", re.I)),
     ("oci_runtime", re.compile(r"OCI runtime create failed", re.I)),
@@ -415,8 +415,9 @@ def diagnose(record: dict, rows: list[dict], llm: dict, env: dict) -> list[str]:
             f"{{}} 占位——这些 stage 没跑出真实快照，不能作为续跑点。"
         )
 
-    if env.get("disk_full"):
-        lines.append("transcript 里出现 no space left on device：磁盘满。")
+    # disk_full 统计已停用（提示词自身的措辞会误报），见 ENV_ERROR_PATTERNS。
+    # if env.get("disk_full"):
+    #     lines.append("transcript 里出现 no space left on device：磁盘满。")
     if env.get("oci_runtime") or env.get("no_such_image"):
         lines.append("transcript 里有容器/镜像启动失败：目标镜像可能没导进 DinD。")
 
