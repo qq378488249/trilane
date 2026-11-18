@@ -1012,10 +1012,10 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
     d_state = daemon_path(state_dir)
 
     started = time.monotonic()
-    started_epoch = time.time()
+    # started_epoch = time.time()
     # 先记下各 transcript 当前大小，之后只扫新增部分，避免上一次尝试的
     # ENOSPC 行被这次重跑重新扫出来（见 snapshot_transcript_sizes）。
-    transcript_sizes = snapshot_transcript_sizes(state_dir)
+    # transcript_sizes = snapshot_transcript_sizes(state_dir)
     dind: DindHandle | None = None
     try:
         if args.isolation == "dind":
