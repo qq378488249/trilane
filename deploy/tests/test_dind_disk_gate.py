@@ -63,6 +63,7 @@ class CheckDindDiskSpaceTests(unittest.TestCase):
         reserved_run=0,
         docker_root="/docker",
         run_root="/runs",
+        docker_root_source=None,
     ):
         handle = cb.DindHandle("dind", "data", "run")
 
@@ -86,6 +87,7 @@ class CheckDindDiskSpaceTests(unittest.TestCase):
                 reserved_run=reserved_run,
                 docker_root=docker_root,
                 run_root=run_root,
+                docker_root_source=docker_root_source,
             )
 
     def test_enough_space_passes(self):
@@ -95,6 +97,11 @@ class CheckDindDiskSpaceTests(unittest.TestCase):
         self.assertEqual(run_need, 5 * GB)
         self.assertIn("镜像盘（docker_root /docker）可用 20.0GB", detail)
         self.assertIn("运行盘（/runs）可用 50.0GB", detail)
+
+    def test_detail_includes_host_source(self):
+        ok, detail, _, _ = self._check(docker_root_source="/host_mnt/d")
+        self.assertTrue(ok)
+        self.assertIn("宿主 /host_mnt/d", detail)
 
     def test_docker_root_below_need_fails(self):
         # 10 + 1 + 5 = 16GB，镜像盘只剩 14GB

@@ -948,6 +948,7 @@ def check_dind_disk_space(
     reserved_run: int = 0,
     docker_root: Path | str | None = None,
     run_root: Path | str | None = None,
+    docker_root_source: str | None = None,
 ) -> tuple[bool, str, int | None, int]:
     """导入镜像前检查镜像盘和运行盘，返回 (ok, detail, docker_need, run_need)。
 
@@ -964,7 +965,10 @@ def check_dind_disk_space(
 
     if docker_root:
         docker_free = free_bytes(docker_root)
-        docker_source = f"docker_root {docker_root}"
+        if docker_root_source:
+            docker_source = f"docker_root {docker_root}，宿主 {docker_root_source}"
+        else:
+            docker_source = f"docker_root {docker_root}"
     elif handle is not None:
         docker_free = dind_free_bytes(handle)
         docker_source = "dind /var/lib/docker"
@@ -1040,6 +1044,7 @@ def disk_gate(
             reserved_run=reserved_run,
             docker_root=getattr(args, "dind_docker_root", None),
             run_root=task_root,
+            docker_root_source=getattr(args, "dind_docker_root_host", None),
         )
         if ok and docker_need is not None and disk_lock is not None:
             args.disk_reserved = reserved_docker + docker_need
@@ -1905,7 +1910,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="忽略已有工作区，重新解包并重跑")
     parser.add_argument("--no-resume", action="store_true", help="不跳过 results.jsonl 里已完成的任务")
     parser.add_argument("--dry-run", action="store_true", help="只做 preflight 和任务包准备，不跑智能体")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # 仅用于日志：镜像盘检查对应的宿主机目录（compose 注入）。
+    args.dind_docker_root_host = os.environ.get("DIND_DOCKER_ROOT_HOST") or None
+    return args
 
 
 def read_task_ids(args: argparse.Namespace) -> list[str]:

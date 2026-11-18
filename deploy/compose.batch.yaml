@@ -49,6 +49,8 @@ x-batch-common: &batch-common
     - ${DIND_DOCKER_ROOT:-${WORK_ROOT:-/var/lib/trilane}}:/docker-root:ro
   environment:
     TZ: ${TZ:-Asia/Shanghai}
+    # 仅用于日志：镜像盘检查对应的宿主机目录（日志里展示宿主路径）
+    DIND_DOCKER_ROOT_HOST: ${DIND_DOCKER_ROOT:-}
     CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
     CYBERGYM_SERVER: ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
     CYBERGYM_API_KEY: ${CYBERGYM_API_KEY:?CYBERGYM_API_KEY is required in .env}
