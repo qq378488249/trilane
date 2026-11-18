@@ -25,6 +25,7 @@
 # * **所有卷都用同路径挂载**（/X:/X）。智能体在 dind 里发出的 `docker run -v <work>/task`
 #   由 dind daemon 解析，所以 task/out 也要同路径挂进 dind 容器。
 #   WORK_ROOT 也必须同路径挂，不能用「宿主目录 → 固定容器路径」的映射。
+#   例外：镜像盘检查用的 DIND_DOCKER_ROOT 只给 runner 读，固定挂到 /docker-root。
 
 x-batch-common: &batch-common
   image: ${RUNNER_IMAGE:-trilane-batch-runner:1.0.1}
@@ -42,6 +43,10 @@ x-batch-common: &batch-common
     - ${TASKS_DIR:-./tasks}:/tasklist:ro
     - ${WORK_ROOT:-/var/lib/trilane}:${WORK_ROOT:-/var/lib/trilane}
     - ${TRILANE_HOME:-/root/.trilane}:/root/.trilane:ro
+    # docker 数据所在盘（只读）：导入前据此判断镜像盘剩余空间。固定挂到
+    # /docker-root，避免和 WORK_ROOT 的挂载目标重复（未配 DIND_DOCKER_ROOT 时源回退到
+    # WORK_ROOT，但检查会退回 dind 内 df）。
+    - ${DIND_DOCKER_ROOT:-${WORK_ROOT:-/var/lib/trilane}}:/docker-root:ro
   environment:
     TZ: ${TZ:-Asia/Shanghai}
     CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
@@ -68,6 +73,15 @@ x-batch-args: &batch-args
   - ${ISOLATION:-dind}
   - --dind-image
   - ${DIND_IMAGE:-docker:dind}
+  # 每个 dind 任务的运行空间预留（GB）；导入镜像前按 本任务需要 + 其他在跑任务预留 检查
+  - --dind-run-space-gb
+  - "${DIND_RUN_SPACE_GB:-5}"
+  # 导入前的 dind 磁盘检查开关：1=开（默认），0=关（完全跳过，不影响其它逻辑）
+  - --dind-disk-check
+  - "${DIND_DISK_CHECK:-1}"
+  # docker 数据所在盘（宿主机路径），挂进容器的固定路径 /docker-root
+  - --dind-docker-root
+  - "${DIND_DOCKER_ROOT:+/docker-root}"
   - --agent-image
   - ${AGENT_IMAGE:-trilane-headless:1.0.1}
   - --concurrency

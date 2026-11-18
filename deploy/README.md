@@ -36,7 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.16，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.17，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
@@ -51,7 +51,7 @@
 | Docker | 20.10+，能 `docker run`。**daemon 必须与服务端同一台**（服务端要靠它起目标容器） |
 | 磁盘 | 两个镜像 ~1GB；数据集 4GB；每任务解包 ~0.25GB；目标镜像每个 0.5–2GB |
 | 内存 | 8GB 起。每个目标容器上限 4GB，**并发 N 就要 N×4GB** |
-| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 4–6GB 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，里面要放目标镜像 + 智能体镜像） |
+| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 (目标镜像 + 智能体镜像 + `DIND_RUN_SPACE_GB`，默认 5GB) 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，里面要放两个镜像和运行数据） |
 
 ---
 
@@ -75,8 +75,8 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.16），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.16.tgz` | 71MB | 同上，带版本号的副本 |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.17），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.17.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
@@ -127,7 +127,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.16 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.17 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -233,7 +233,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.16 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.17 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -242,13 +242,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.16 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.16 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.17 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.16 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.17 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -381,7 +381,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.16 \
+  trilane-batch-runner:1.0.17 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -396,8 +396,10 @@ docker run -d --name trilane-batch-1 \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   -v /root/.trilane:/root/.trilane:ro \
+  # 镜像盘检查：宿主机 docker 数据目录（同路径只读挂载）；不配则退回 dind 内 df
+  -v /var/lib/docker:/var/lib/docker:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.16 \
+  trilane-batch-runner:1.0.17 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -406,13 +408,15 @@ docker run -d --name trilane-batch-1 \
     --agent-id trilane-prod-1 \
     --concurrency 1 \
     --timeout-sec 14400 \
-    --work-root /var/lib/trilane/runs/batch-1
+    --work-root /var/lib/trilane/runs/batch-1 \
+    --dind-docker-root /var/lib/docker
 
 docker logs -f trilane-batch-1
 ```
 
 这条方式没有 `network_mode: host`，所以服务端地址要用 `host.docker.internal:8666`，
-并配 `--add-host`。
+并配 `--add-host`。镜像盘检查需要把 `--dind-docker-root` 指向的路径**同路径只读挂载**
+进容器；不配这个参数则退回 dind 内 `df`（Linux 实体分区时也可用，Docker Desktop 上必须配）。
 
 ### 挂载清单与理由
 
@@ -424,6 +428,7 @@ docker logs -f trilane-batch-1
 | `deploy/tasks` | 任务列表 | **挂载而非烤进镜像**，换批次不用重建镜像 |
 | `/var/lib/trilane` | 产物根 | 读写；每任务的源码/产物都落这儿 |
 | `/root/.trilane` | 模型配置 | 只读；脚本每个任务拷一份到 task 独占 state 目录 |
+| docker 数据目录（`DIND_DOCKER_ROOT`） | 镜像盘剩余空间检查 | compose 只读挂到 `/docker-root`；不挂则检查退回 dind 内 `df`（Docker Desktop 上会虚报） |
 
 ### 一个重要的行为差异
 
@@ -505,7 +510,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 | `unstable` | 多轮投票平票 | 跳过 |
 | `vul_only` | 只拿到 vul 侧（没配口令，未跑 fix 侧） | 跳过 |
 | `agent_failed` | LLM 429/断连、容器起不来 | **重跑** |
-| `disk_space` | 磁盘/存储不足，runner 已停止该任务，未做清理（1.0.16 起检测暂时停用，不会再产生此状态） | **修复磁盘后重跑** |
+| `disk_space` | 磁盘/存储不足：导入镜像前预检不通过（整批停止），或运行中撞到 ENOSPC | **修复磁盘后重跑** |
 | `timeout` / `error` | 超时 / 脚本异常 | **重跑** |
 
 断点续跑：**同 `AGENT_ID` + 同 `WORK_ROOT`** 再跑一次，已完成的自动跳过。
@@ -576,7 +581,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.16 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.17 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
@@ -620,15 +625,34 @@ Dir），需要宿主允许 `--privileged`。**目标镜像和智能体镜像都
 docker ps -aq --filter label=trilane.role=dind | xargs -r docker rm -f
 ```
 
-**磁盘**：40 个任务约需 10GB。脚本在剩余低于 8GB 时直接拒绝开跑（preflight）。注意
-preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。智能体遇到 `no space left on device`
-时**不得自行清理**；修复磁盘后再续跑。Docker Root Dir 和 containerd 状态目录所在分区
-要单独留足空间。
+**磁盘**：40 个任务约需 10GB。preflight 在 `WORK_ROOT` 剩余低于 8GB 时直接拒绝开跑。
+每个任务在导入镜像前还会检查两块盘（配了 `DIND_DOCKER_ROOT` 时会提前到起 dind 之前）：
 
-> 1.0.16 起 runner **不再自动检测 transcript 里的磁盘错误**，`triage` 的
-> `[环境错误] … disk_full×N` 统计也一并停用：提示词本身就写着
-> `no space left on device` 的处置规则，模型也会在推理里复述，按文本检测会误判成
-> 真实磁盘满。磁盘不足目前靠 preflight（剩余 < 8GB 拒绝开跑）兜底。
+- 镜像盘：`DIND_DOCKER_ROOT`（不配则用 dind 内的 `/var/lib/docker`）
+  可用 >= 目标镜像 + 智能体镜像 + `DIND_RUN_SPACE_GB`
+- 运行盘：`WORK_ROOT`
+  可用 >= `DIND_RUN_SPACE_GB`
+
+两项都加上其他在跑任务的预留；并发 N 同时启动时等价于 N 倍，但已占用的空间不重复计算。
+镜像大小用 `docker image inspect` 读。**Docker Desktop 上必须配 `DIND_DOCKER_ROOT`**：dind 的
+`df` 只反映 vhdx 内部 ext4（会报出远大于宿主剩余的可用空间）。`DIND_DOCKER_ROOT` 是 compose
+层的**宿主机路径**，compose 会把它只读挂到容器里的 `/docker-root`，再以
+`--dind-docker-root /docker-root` 传给 runner（脚本只看容器内路径）：Docker Desktop 用
+`/host_mnt/d`（**不要用 WSL 里的 `/mnt/d`**：目录能看到，但 statvfs 会返回错误的小数值，
+实测 0.06GB）；Linux 上留空即可用 dind 内 `df`，要用就填真实的 docker 数据目录
+（如 `/var/lib/docker`）。
+
+不满足时该任务记 `disk_space`，并且整批停止：队列里还没开始的任务直接跳过，正在跑的
+任务跑完为止。测量失败（路径 / `df` / `inspect` 出错）不拦批次，只记日志。不想让这项
+检查参与时，设 `DIND_DISK_CHECK=0`（compose）或 `TRILANE_DIND_DISK_CHECK=0` /
+`--dind-disk-check 0`（直接跑脚本）即可完全跳过，其余逻辑不变。
+
+智能体遇到 `no space left on device` 时**不得自行清理**；修复磁盘后再续跑。
+Docker Root Dir 和 containerd 状态目录所在分区要单独留足空间。
+
+> runner **不检测 transcript 里的磁盘错误**，`triage` 的 `[环境错误] … disk_full×N`
+> 统计也停用：提示词本身就写着 `no space left on device` 的处置规则，模型也会在推理里
+> 复述，按文本检测会误判成真实磁盘满。磁盘不足靠 preflight 和导入前的 dind 盘检查兜底。
 
 **agent_id 去重**：服务端按 `(agent_id, task_id, poc_hash)` 去重。同一 agent_id 重跑同一
 份 PoC 会命中缓存拿旧结果。投票机制靠派生 id（`<agent>-r1`/`-r2`）规避；批次之间换
