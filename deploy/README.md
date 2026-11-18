@@ -36,7 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.15，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.16，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
@@ -75,8 +75,8 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.15），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.15.tgz` | 71MB | 同上，带版本号的副本 |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.16），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.16.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
@@ -127,7 +127,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.15 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.16 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -233,7 +233,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.15 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.16 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -242,13 +242,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.15 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.15 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.16 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.15 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.16 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -381,7 +381,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.15 \
+  trilane-batch-runner:1.0.16 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -397,7 +397,7 @@ docker run -d --name trilane-batch-1 \
   -v /var/lib/trilane:/var/lib/trilane \
   -v /root/.trilane:/root/.trilane:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.15 \
+  trilane-batch-runner:1.0.16 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -505,7 +505,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 | `unstable` | 多轮投票平票 | 跳过 |
 | `vul_only` | 只拿到 vul 侧（没配口令，未跑 fix 侧） | 跳过 |
 | `agent_failed` | LLM 429/断连、容器起不来 | **重跑** |
-| `disk_space` | 磁盘/存储不足，runner 已停止该任务，未做清理（1.0.15 起检测暂时停用，不会再产生此状态） | **修复磁盘后重跑** |
+| `disk_space` | 磁盘/存储不足，runner 已停止该任务，未做清理（1.0.16 起检测暂时停用，不会再产生此状态） | **修复磁盘后重跑** |
 | `timeout` / `error` | 超时 / 脚本异常 | **重跑** |
 
 断点续跑：**同 `AGENT_ID` + 同 `WORK_ROOT`** 再跑一次，已完成的自动跳过。
@@ -576,7 +576,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.15 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.16 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
@@ -625,7 +625,8 @@ preflight 测的是挂载进来的 `WORK_ROOT` 所在分区。智能体遇到 `n
 时**不得自行清理**；修复磁盘后再续跑。Docker Root Dir 和 containerd 状态目录所在分区
 要单独留足空间。
 
-> 1.0.15 起 runner **不再自动检测 transcript 里的磁盘错误**：提示词本身就写着
+> 1.0.16 起 runner **不再自动检测 transcript 里的磁盘错误**，`triage` 的
+> `[环境错误] … disk_full×N` 统计也一并停用：提示词本身就写着
 > `no space left on device` 的处置规则，模型也会在推理里复述，按文本检测会误判成
 > 真实磁盘满。磁盘不足目前靠 preflight（剩余 < 8GB 拒绝开跑）兜底。
 
