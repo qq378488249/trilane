@@ -1115,15 +1115,17 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
 
         # 磁盘不足时绝不自动重试：重试只会让模型再次面对同一块满盘，
         # 历史上正是这个场景触发了全局 docker prune。留给人工处理。
-        disk_error = detect_disk_space_error(state_dir, started_epoch, transcript_sizes)
-        if disk_error:
-            return RunOutcome(
-                "disk_space",
-                rc,
-                duration,
-                result,
-                f"检测到磁盘空间不足，已停止（不清理、不重试）：{disk_error}",
-            )
+        # 2026-11-18 暂时停用：提示词里本来就写着 "no space left on device" 的
+        # 处置规则，模型也会在推理里复述，检测会把它误判成真实磁盘满。
+        # disk_error = detect_disk_space_error(state_dir, started_epoch, transcript_sizes)
+        # if disk_error:
+        #     return RunOutcome(
+        #         "disk_space",
+        #         rc,
+        #         duration,
+        #         result,
+        #         f"检测到磁盘空间不足，已停止（不清理、不重试）：{disk_error}",
+        #     )
 
         if rc is None:
             return RunOutcome("timeout", None, duration, result, f"硬超时 {args.timeout_sec + 600}s，已强杀容器")

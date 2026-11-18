@@ -8,6 +8,9 @@
 1. 首次执行时磁盘满 → 判 disk_space；
 2. 清盘后重跑，transcript 追加了新内容但没有新的 ENOSPC → 不该再判 disk_space；
 3. 续跑时引擎删掉 stage 重建（文件变小）并写入新的 ENOSPC → 必须判出来。
+
+注意：1.0.15 把 run_agent 里的磁盘检测整段注释掉了（提示词自身的 ENOSPC 措辞会被
+误判成真实磁盘满），所以这三个用例暂时 skip；检测恢复时把 skip 去掉即可。
 """
 
 from __future__ import annotations
@@ -82,6 +85,18 @@ class DiskResumeFlowTests(unittest.TestCase):
              mock.patch.object(cb, "run_agent_in_dind", fake):
             return cb.run_agent(self.task, self.task_root, self.args)
 
+    def test_transcript_enospc_no_longer_halts_task(self):
+        """1.0.15：transcript 里出现 ENOSPC 字样不再让 run_agent 判 disk_space。
+
+        提示词和模型推理里都会复述这句话，按文本检测会误判；检测恢复前，
+        这个用例钉住"不再中断任务"的行为。
+        """
+        self.transcript.write_text("# header\n", encoding="utf-8")
+        outcome = self._run(FakeAgent(self.transcript, ENOSPC + "\n"))
+        self.assertNotEqual(outcome.status, "disk_space")
+        self.assertNotIn("no space left", outcome.detail)
+
+    @unittest.skip("1.0.15 暂时停用 run_agent 里的磁盘检测")
     def test_first_attempt_with_disk_full(self):
         """首次执行就撞 ENOSPC → 判 disk_space。"""
         self.transcript.write_text("# header\n", encoding="utf-8")
@@ -91,6 +106,7 @@ class DiskResumeFlowTests(unittest.TestCase):
         self.assertIn("no space left on device", outcome.detail)
         self.assertEqual(fake.calls, 1)
 
+    @unittest.skip("1.0.15 暂时停用 run_agent 里的磁盘检测")
     def test_retry_after_clearing_does_not_report_again(self):
         """清盘后重跑：旧 ENOSPC 行还在文件里，但不该再判 disk_space。"""
         # 第 1 轮：真满
@@ -103,6 +119,7 @@ class DiskResumeFlowTests(unittest.TestCase):
         self.assertNotEqual(second.status, "disk_space", "清盘后的重跑不该再报磁盘满")
         self.assertNotIn("no space left", second.detail)
 
+    @unittest.skip("1.0.15 暂时停用 run_agent 里的磁盘检测")
     def test_resume_recreating_stage_still_detects_new_error(self):
         """续跑时引擎删掉 stage 重建（文件变小），新的 ENOSPC 必须报出来。"""
         self.transcript.write_text("x" * 5000, encoding="utf-8")
