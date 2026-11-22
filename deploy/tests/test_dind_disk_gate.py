@@ -251,7 +251,7 @@ class RunAgentDiskGateTests(unittest.TestCase):
         self.assertEqual(self.args.run_reserved, 5 * GB)
 
     def test_disabled_skips_check_and_loads(self):
-        self.args.dind_disk_check = False
+        self.args.disk_check = False
         loads = []
 
         def check(*args, **kwargs):
@@ -267,18 +267,28 @@ class RunAgentDiskGateTests(unittest.TestCase):
 class DiskCheckSwitchTests(unittest.TestCase):
     def test_default_is_on(self):
         with mock.patch.dict(os.environ):
+            os.environ.pop("TRILANE_DISK_CHECK", None)
             os.environ.pop("TRILANE_DIND_DISK_CHECK", None)
             args = cb.parse_args(["--task-id", "arvo:3938"])
-        self.assertTrue(args.dind_disk_check)
+        self.assertTrue(args.disk_check)
 
     def test_env_disables(self):
+        with mock.patch.dict(os.environ, {"TRILANE_DISK_CHECK": "0"}):
+            args = cb.parse_args(["--task-id", "arvo:3938"])
+        self.assertFalse(args.disk_check)
+
+    def test_legacy_env_still_disables(self):
         with mock.patch.dict(os.environ, {"TRILANE_DIND_DISK_CHECK": "0"}):
             args = cb.parse_args(["--task-id", "arvo:3938"])
-        self.assertFalse(args.dind_disk_check)
+        self.assertFalse(args.disk_check)
 
     def test_cli_disables(self):
         args = cb.parse_args(["--task-id", "arvo:3938", "--dind-disk-check", "0"])
-        self.assertFalse(args.dind_disk_check)
+        self.assertFalse(args.disk_check)
+
+    def test_new_cli_name_disables(self):
+        args = cb.parse_args(["--task-id", "arvo:3938", "--disk-check", "0"])
+        self.assertFalse(args.disk_check)
 
     def test_docker_root_from_env(self):
         with mock.patch.dict(os.environ, {"TRILANE_DIND_DOCKER_ROOT": "/host_mnt/d"}):

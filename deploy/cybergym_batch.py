@@ -939,6 +939,33 @@ def dind_free_bytes(handle: DindHandle) -> int | None:
         return None
 
 
+def check_run_disk_space(
+    run_root: Path | str | None,
+    run_space_gb: float,
+    *,
+    reserved_run: int = 0,
+) -> tuple[bool, str, int | None]:
+    """检查运行盘（WORK_ROOT）剩余空间，返回 (ok, detail, need)。
+
+    need 是本任务要预留的字节数。路径不可读时 need 为 None：调用方应跳过检查、
+    不预留空间，让后续真正的写入兜底（与 dind 模式处理测量失败的方式一致）。
+    detail 不带"磁盘空间不足"前缀，由调用方按自己的上下文补。
+    """
+    run_need = int(run_space_gb * 1e9)
+    run_free = free_bytes(run_root)
+    if run_free is None:
+        return True, f"运行盘检查跳过（{run_root} 不可读）", None
+    run_required = run_need + reserved_run
+    detail = (
+        f"运行盘（{run_root}）可用 {run_free / 1e9:.1f}GB，"
+        f"需要 {run_required / 1e9:.1f}GB"
+        f"（运行空间 {run_space_gb:.1f}GB"
+        + (f" + 其他任务预留 {reserved_run / 1e9:.1f}GB" if reserved_run else "")
+        + "）"
+    )
+    return run_free >= run_required, detail, run_need
+
+
 def check_dind_disk_space(
     handle: DindHandle,
     images: tuple[str, ...],
@@ -977,15 +1004,21 @@ def check_dind_disk_space(
 
     sizes = [(image, image_size_bytes(image)) for image in images]
     unknown = [image for image, size in sizes if size is None]
-    run_free = free_bytes(run_root) if run_root else None
+    run_ok = True
+    run_detail: str | None = None
+    run_need_measured: int | None = None
+    if run_root:
+        run_ok, run_detail, run_need_measured = check_run_disk_space(
+            run_root, run_space_gb, reserved_run=reserved_run
+        )
 
-    if docker_free is None or unknown or (run_root and run_free is None):
+    if docker_free is None or unknown or (run_root and run_need_measured is None):
         bad = []
         if docker_free is None:
             bad.append(f"镜像盘不可读（{docker_source}）")
         if unknown:
             bad.append("镜像大小读取失败：" + "、".join(unknown))
-        if run_root and run_free is None:
+        if run_root and run_need_measured is None:
             bad.append(f"运行盘不可读（{run_root}）")
         detail = "磁盘检查跳过（" + "；".join(bad) + "）"
         log(detail)
@@ -994,7 +1027,8 @@ def check_dind_disk_space(
     image_bytes = sum(size for _, size in sizes)
     docker_need = image_bytes + run_need
     docker_required = docker_need + reserved_docker
-    run_required = run_need + reserved_run
+    # 本模式没有 run_root 时只预留镜像盘，运行盘由 host 模式的 run_only 路径预留。
+    run_reserve = run_need_measured if run_root else 0
 
     parts = [
         f"镜像盘（{docker_source}）可用 {docker_free / 1e9:.1f}GB，"
@@ -1003,18 +1037,12 @@ def check_dind_disk_space(
         + (f" + 其他任务预留 {reserved_docker / 1e9:.1f}GB" if reserved_docker else "")
         + "）"
     ]
-    if run_free is not None:
-        parts.append(
-            f"运行盘（{run_root}）可用 {run_free / 1e9:.1f}GB，"
-            f"需要 {run_required / 1e9:.1f}GB"
-            f"（运行空间 {run_space_gb:.1f}GB"
-            + (f" + 其他任务预留 {reserved_run / 1e9:.1f}GB" if reserved_run else "")
-            + "）"
-        )
+    if run_detail is not None:
+        parts.append(run_detail)
     detail = "；".join(parts)
-    if docker_free >= docker_required and (run_free is None or run_free >= run_required):
-        return True, detail, docker_need, run_need if run_free is not None else 0
-    return False, "磁盘空间不足：" + detail, docker_need, run_need if run_free is not None else 0
+    if docker_free >= docker_required and run_ok:
+        return True, detail, docker_need, run_reserve
+    return False, "磁盘空间不足：" + detail, docker_need, run_reserve
 
 
 def disk_gate(
@@ -1023,11 +1051,14 @@ def disk_gate(
     args: argparse.Namespace,
     dind: DindHandle | None,
     started: float,
+    *,
+    run_only: bool = False,
 ) -> tuple[RunOutcome | None, tuple[int, int]]:
-    """导入前的磁盘检查 + 预留。
+    """启动容器前的磁盘检查 + 预留。
 
     返回 (None, 预留量) 表示通过；返回 (RunOutcome, (0, 0)) 表示不足、应直接结束。
     dind 为 None 时必须配了 docker_root——不用起容器就能判断。
+    run_only=True 用于 host 模式：只查运行盘（WORK_ROOT），不查镜像盘。
     """
     disk_lock = getattr(args, "disk_lock", None)
     if disk_lock is not None:
@@ -1036,20 +1067,32 @@ def disk_gate(
     try:
         reserved_docker = getattr(args, "disk_reserved", 0)
         reserved_run = getattr(args, "run_reserved", 0)
-        ok, detail, docker_need, run_need = check_dind_disk_space(
-            dind,
-            (task.vul_image, args.agent_image),
-            args.dind_run_space_gb,
-            reserved_docker=reserved_docker,
-            reserved_run=reserved_run,
-            docker_root=getattr(args, "dind_docker_root", None),
-            run_root=task_root,
-            docker_root_source=getattr(args, "dind_docker_root_host", None),
-        )
-        if ok and docker_need is not None and disk_lock is not None:
-            args.disk_reserved = reserved_docker + docker_need
-            args.run_reserved = reserved_run + run_need
-            reserved_here = (docker_need, run_need)
+        if run_only:
+            ok, detail, run_need = check_run_disk_space(
+                task_root,
+                getattr(args, "run_space_gb", 5.0),
+                reserved_run=reserved_run,
+            )
+            if ok and run_need is not None and disk_lock is not None:
+                args.run_reserved = reserved_run + run_need
+                reserved_here = (0, run_need)
+            if not ok:
+                detail = "磁盘空间不足：" + detail
+        else:
+            ok, detail, docker_need, run_need = check_dind_disk_space(
+                dind,
+                (task.vul_image, args.agent_image),
+                args.run_space_gb,
+                reserved_docker=reserved_docker,
+                reserved_run=reserved_run,
+                docker_root=getattr(args, "dind_docker_root", None),
+                run_root=task_root,
+                docker_root_source=getattr(args, "dind_docker_root_host", None),
+            )
+            if ok and docker_need is not None and disk_lock is not None:
+                args.disk_reserved = reserved_docker + docker_need
+                args.run_reserved = reserved_run + run_need
+                reserved_here = (docker_need, run_need)
     finally:
         if disk_lock is not None:
             disk_lock.release()
@@ -1200,8 +1243,8 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
             # 配了 docker_root 就不需要 dind 来测盘：起容器之前先把盘查清楚，
             # 不够就直接放弃，连 dind 都不用起。
             docker_root = getattr(args, "dind_docker_root", None)
-            if not getattr(args, "dind_disk_check", True):
-                log(f"[{task.task_id}] 磁盘检查已关闭（DIND_DISK_CHECK=0）")
+            if not getattr(args, "disk_check", True):
+                log(f"[{task.task_id}] 磁盘检查已关闭（DISK_CHECK=0）")
             elif docker_root:
                 blocked, reserved_here = disk_gate(task, task_root, args, None, started)
                 if blocked is not None:
@@ -1218,7 +1261,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                         "DinD 启动后未就绪",
                     )
                 # 没配 docker_root 时只能进 dind 里测 /var/lib/docker。
-                if getattr(args, "dind_disk_check", True) and not docker_root:
+                if getattr(args, "disk_check", True) and not docker_root:
                     blocked, reserved_here = disk_gate(task, task_root, args, dind, started)
                     if blocked is not None:
                         return blocked
@@ -1254,6 +1297,16 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
             )
             duration = time.monotonic() - started
         else:
+            # host 模式不导入镜像（agent 直接用宿主 daemon 里的镜像），
+            # 只查运行盘：任务目录所在盘的可用空间要覆盖本任务预留 + 其他在跑任务的预留。
+            if not getattr(args, "disk_check", True):
+                log(f"[{task.task_id}] 磁盘检查已关闭（DISK_CHECK=0）")
+            else:
+                blocked, reserved_here = disk_gate(
+                    task, task_root, args, None, started, run_only=True
+                )
+                if blocked is not None:
+                    return blocked
             cmd = [
                 "docker", "run", "--rm", "--name", container,
                 "--label", "trilane.role=agent",
@@ -1858,21 +1911,36 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="DinD 镜像（--isolation dind 时使用）",
     )
     parser.add_argument(
+        "--run-space-gb",
         "--dind-run-space-gb",
+        dest="run_space_gb",
         type=float,
-        default=float(os.environ.get("TRILANE_DIND_RUN_SPACE_GB") or 5.0),
+        default=float(
+            os.environ.get("TRILANE_RUN_SPACE_GB")
+            or os.environ.get("TRILANE_DIND_RUN_SPACE_GB")
+            or 5.0
+        ),
         help=(
-            "每个 dind 任务的运行空间预留（GB，日志/容器可写层等）。导入镜像前要求 "
-            "dind 盘可用 >= 本任务需要 + 其他在跑任务的预留（并发 N 时约等于 N 倍）；"
-            "不足则整批停止"
+            "每个任务的运行空间预留（GB，日志/容器可写层等）。dind 模式要求镜像盘可用 >= "
+            "目标镜像 + 智能体镜像 + 该值；两种模式都要求运行盘可用 >= 该值 + 其他在跑"
+            "任务的预留（并发 N 时约等于 N 倍）；不足则整批停止"
         ),
     )
     parser.add_argument(
+        "--disk-check",
         "--dind-disk-check",
+        dest="disk_check",
         type=bool_value,
-        default=bool_value(os.environ.get("TRILANE_DIND_DISK_CHECK", "1")),
+        default=bool_value(
+            os.environ.get("TRILANE_DISK_CHECK")
+            or os.environ.get("TRILANE_DIND_DISK_CHECK")
+            or "1"
+        ),
         metavar="{0,1}",
-        help="导入镜像前是否检查 dind 磁盘空间；0/false/off 关闭，默认开启",
+        help=(
+            "启动任务前是否检查磁盘空间；0/false/off 关闭，默认开启。"
+            "host 模式只查运行盘，dind 模式另外查镜像盘"
+        ),
     )
     parser.add_argument(
         "--dind-docker-root",
