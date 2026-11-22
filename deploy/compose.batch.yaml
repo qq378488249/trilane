@@ -75,12 +75,14 @@ x-batch-args: &batch-args
   - ${ISOLATION:-dind}
   - --dind-image
   - ${DIND_IMAGE:-docker:dind}
-  # 每个 dind 任务的运行空间预留（GB）；导入镜像前按 本任务需要 + 其他在跑任务预留 检查
-  - --dind-run-space-gb
-  - "${DIND_RUN_SPACE_GB:-5}"
-  # 导入前的 dind 磁盘检查开关：1=开（默认），0=关（完全跳过，不影响其它逻辑）
-  - --dind-disk-check
-  - "${DIND_DISK_CHECK:-1}"
+  # 每个任务的运行空间预留（GB）：dind 模式导入镜像前按 本任务需要 + 其他在跑任务预留
+  # 检查镜像盘和运行盘；host 模式只检查运行盘。旧变量名 DIND_RUN_SPACE_GB 仍兼容。
+  - --run-space-gb
+  - "${RUN_SPACE_GB:-${DIND_RUN_SPACE_GB:-5}}"
+  # 启动任务前的磁盘检查开关：1=开（默认），0=关（完全跳过，不影响其它逻辑）。
+  # 旧变量名 DIND_DISK_CHECK 仍兼容。
+  - --disk-check
+  - "${DISK_CHECK:-${DIND_DISK_CHECK:-1}}"
   # docker 数据所在盘（宿主机路径），挂进容器的固定路径 /docker-root
   - --dind-docker-root
   - "${DIND_DOCKER_ROOT:+/docker-root}"

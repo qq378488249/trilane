@@ -51,7 +51,7 @@
 | Docker | 20.10+，能 `docker run`。**daemon 必须与服务端同一台**（服务端要靠它起目标容器） |
 | 磁盘 | 两个镜像 ~1GB；数据集 4GB；每任务解包 ~0.25GB；目标镜像每个 0.5–2GB |
 | 内存 | 8GB 起。每个目标容器上限 4GB，**并发 N 就要 N×4GB** |
-| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 (目标镜像 + 智能体镜像 + `DIND_RUN_SPACE_GB`，默认 5GB) 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，里面要放两个镜像和运行数据） |
+| DinD | 默认 `--isolation dind`：宿主需允许 `--privileged`；每个并发任务额外预留 (目标镜像 + 智能体镜像 + `RUN_SPACE_GB`，默认 5GB) 磁盘（dind 的 `/var/lib/docker` 是 Docker named volume，里面要放两个镜像和运行数据）。`host` 模式不导入镜像，只按 `RUN_SPACE_GB` 预留运行盘 |
 
 ---
 
@@ -428,7 +428,7 @@ docker logs -f trilane-batch-1
 | `deploy/tasks` | 任务列表 | **挂载而非烤进镜像**，换批次不用重建镜像 |
 | `/var/lib/trilane` | 产物根 | 读写；每任务的源码/产物都落这儿 |
 | `/root/.trilane` | 模型配置 | 只读；脚本每个任务拷一份到 task 独占 state 目录 |
-| docker 数据目录（`DIND_DOCKER_ROOT`） | 镜像盘剩余空间检查 | compose 只读挂到 `/docker-root`；不挂则检查退回 dind 内 `df`（Docker Desktop 上会虚报） |
+| docker 数据目录（`DIND_DOCKER_ROOT`） | dind 模式的镜像盘剩余空间检查 | compose 只读挂到 `/docker-root`；不挂则检查退回 dind 内 `df`（Docker Desktop 上会虚报） |
 
 ### 一个重要的行为差异
 
@@ -453,8 +453,10 @@ runner 起的 dind 是**兄弟容器**（sibling），智能体又跑在 dind �
 | `--api-key` | `$CYBERGYM_API_KEY` | 只用于 fix 侧判定 |
 | `--salt` | `CyberGym` | **必须与服务端一致**，否则 400 Invalid checksum |
 | `--agent-id` | 按批次生成 | **上传归账用**，同批用同一个 |
-| `--isolation` | `dind` | `dind` = 智能体和目标容器都跑在每任务独立的 daemon 里；`host` = 旧行为，智能体直连宿主 daemon |
+| `--isolation` | `dind` | `dind` = 智能体和目标容器都跑在每任务独立的 daemon 里；`host` = 旧行为，智能体直连宿主 daemon（两种模式启动前都检查运行盘） |
 | `--dind-image` | `docker:dind` | DinD 镜像 |
+| `--run-space-gb` | 5 | 每个任务的运行空间预留；运行盘（WORK_ROOT）按它检查，dind 模式的镜像盘也按它预留（旧名 `--dind-run-space-gb` 兼容） |
+| `--disk-check` | 1 | 启动任务前是否检查磁盘；0/false/off 关闭（旧名 `--dind-disk-check` 兼容） |
 | `--concurrency` | 2 | 并发任务数；内存受限，建议 1–2 |
 | `--timeout-sec` | 14400 | 单任务超时（4 小时） |
 | `--agent-retries` | 1 | 智能体因 OOM/启动失败中断时批内自动重试次数 |
@@ -510,7 +512,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
 | `unstable` | 多轮投票平票 | 跳过 |
 | `vul_only` | 只拿到 vul 侧（没配口令，未跑 fix 侧） | 跳过 |
 | `agent_failed` | LLM 429/断连、容器起不来 | **重跑** |
-| `disk_space` | 磁盘/存储不足：导入镜像前预检不通过（整批停止），或运行中撞到 ENOSPC | **修复磁盘后重跑** |
+| `disk_space` | 磁盘/存储不足：启动容器前预检不通过（整批停止），或运行中撞到 ENOSPC | **修复磁盘后重跑** |
 | `timeout` / `error` | 超时 / 脚本异常 | **重跑** |
 
 断点续跑：**同 `AGENT_ID` + 同 `WORK_ROOT`** 再跑一次，已完成的自动跳过。
@@ -626,14 +628,15 @@ docker ps -aq --filter label=trilane.role=dind | xargs -r docker rm -f
 ```
 
 **磁盘**：40 个任务约需 10GB。preflight 在 `WORK_ROOT` 剩余低于 8GB 时直接拒绝开跑。
-每个任务在导入镜像前还会检查两块盘（配了 `DIND_DOCKER_ROOT` 时会提前到起 dind 之前）：
+每个任务启动容器前还会检查运行盘（`WORK_ROOT`）；`dind` 模式额外检查镜像盘（配了
+`DIND_DOCKER_ROOT` 时会提前到起 dind 之前）：
 
-- 镜像盘：`DIND_DOCKER_ROOT`（不配则用 dind 内的 `/var/lib/docker`）
-  可用 >= 目标镜像 + 智能体镜像 + `DIND_RUN_SPACE_GB`
-- 运行盘：`WORK_ROOT`
-  可用 >= `DIND_RUN_SPACE_GB`
+- 运行盘（两种模式）：`WORK_ROOT` 可用 >= 本任务 `RUN_SPACE_GB`
+- 镜像盘（仅 dind）：`DIND_DOCKER_ROOT`（不配则用 dind 内的 `/var/lib/docker`）
+  可用 >= 目标镜像 + 智能体镜像 + `RUN_SPACE_GB`
 
 两项都加上其他在跑任务的预留；并发 N 同时启动时等价于 N 倍，但已占用的空间不重复计算。
+host 模式不导入镜像，智能体直接用宿主 daemon 里的镜像，所以只检查运行盘。
 镜像大小用 `docker image inspect` 读。**Docker Desktop 上必须配 `DIND_DOCKER_ROOT`**：dind 的
 `df` 只反映 vhdx 内部 ext4（会报出远大于宿主剩余的可用空间）。`DIND_DOCKER_ROOT` 是 compose
 层的**宿主机路径**，compose 会把它只读挂到容器里的 `/docker-root`，再以
@@ -644,15 +647,16 @@ docker ps -aq --filter label=trilane.role=dind | xargs -r docker rm -f
 
 不满足时该任务记 `disk_space`，并且整批停止：队列里还没开始的任务直接跳过，正在跑的
 任务跑完为止。测量失败（路径 / `df` / `inspect` 出错）不拦批次，只记日志。不想让这项
-检查参与时，设 `DIND_DISK_CHECK=0`（compose）或 `TRILANE_DIND_DISK_CHECK=0` /
-`--dind-disk-check 0`（直接跑脚本）即可完全跳过，其余逻辑不变。
+检查参与时，设 `DISK_CHECK=0`（compose）或 `TRILANE_DISK_CHECK=0` / `--disk-check 0`
+（直接跑脚本）即可完全跳过，其余逻辑不变。旧变量名 `DIND_RUN_SPACE_GB` /
+`DIND_DISK_CHECK` 和旧参数名 `--dind-run-space-gb` / `--dind-disk-check` 仍然兼容。
 
 智能体遇到 `no space left on device` 时**不得自行清理**；修复磁盘后再续跑。
 Docker Root Dir 和 containerd 状态目录所在分区要单独留足空间。
 
 > runner **不检测 transcript 里的磁盘错误**，`triage` 的 `[环境错误] … disk_full×N`
 > 统计也停用：提示词本身就写着 `no space left on device` 的处置规则，模型也会在推理里
-> 复述，按文本检测会误判成真实磁盘满。磁盘不足靠 preflight 和导入前的 dind 盘检查兜底。
+> 复述，按文本检测会误判成真实磁盘满。磁盘不足靠 preflight 和启动前的盘检查兜底。
 
 **agent_id 去重**：服务端按 `(agent_id, task_id, poc_hash)` 去重。同一 agent_id 重跑同一
 份 PoC 会命中缓存拿旧结果。投票机制靠派生 id（`<agent>-r1`/`-r2`）规避；批次之间换
