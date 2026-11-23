@@ -62,22 +62,42 @@ fn expand_path(token: &str) -> Option<PathBuf> {
     Some(PathBuf::from(token))
 }
 
+const MAX_SCAN_DEPTH: usize = 32;
+const MAX_SCAN_ENTRIES: usize = 20_000;
+const MAX_SCANNED_FILES: usize = 2_500;
+
 fn scan_root(root: &Path, lane: Option<&str>, max_items: usize) -> Vec<SourceScanFact> {
     let mut facts = Vec::new();
     let mut seen = HashSet::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut files_seen = 0usize;
-    while let Some(path) = stack.pop() {
-        let Ok(meta) = fs::metadata(&path) else {
+    let mut entries_seen = 0usize;
+    while let Some((path, depth)) = stack.pop() {
+        entries_seen += 1;
+        if entries_seen > MAX_SCAN_ENTRIES || facts.len() >= max_items {
+            break;
+        }
+        // `fs::metadata` follows symlinks, so a self-referential link such as
+        // `doc/man7 -> .` makes the path grow without bound. Only walk real
+        // tree contents, but let the root itself be a link to the tree.
+        let meta = if depth == 0 {
+            fs::metadata(&path)
+        } else {
+            fs::symlink_metadata(&path)
+        };
+        let Ok(meta) = meta else {
             continue;
         };
+        if depth > 0 && meta.file_type().is_symlink() {
+            continue;
+        }
         if meta.is_dir() {
-            if should_skip_dir(&path) {
+            if depth >= MAX_SCAN_DEPTH || should_skip_dir(&path) {
                 continue;
             }
             if let Ok(entries) = fs::read_dir(&path) {
                 for entry in entries.flatten() {
-                    stack.push(entry.path());
+                    stack.push((entry.path(), depth + 1));
                 }
             }
             continue;
@@ -86,7 +106,7 @@ fn scan_root(root: &Path, lane: Option<&str>, max_items: usize) -> Vec<SourceSca
             continue;
         }
         files_seen += 1;
-        if files_seen > 2_500 || facts.len() >= max_items {
+        if files_seen > MAX_SCANNED_FILES {
             break;
         }
         scan_file(root, &path, lane, max_items, &mut seen, &mut facts);
@@ -584,6 +604,43 @@ fn marker_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_symlink_loops() {
+        let root = std::env::temp_dir().join(format!(
+            "trilane-scanner-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("doc")).unwrap();
+        fs::write(
+            root.join("doc/run.md"),
+            "sequelize.query(`SELECT * FROM Users WHERE email='${req.body.email}'`)\n",
+        )
+        .unwrap();
+        if !make_dir_symlink(Path::new("."), &root.join("doc/loop")) {
+            // Symlink creation needs privileges we may not have on Windows.
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let facts = scan_root(&root, None, 40);
+        assert!(facts.iter().any(|fact| fact.target.contains("run.md:")));
+        assert!(facts.iter().all(|fact| !fact.target.contains("loop")));
+        assert!(facts.len() <= 40);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    fn make_dir_symlink(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_dir_symlink(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
 
     #[test]
     fn scans_high_value_web_snippets() {
