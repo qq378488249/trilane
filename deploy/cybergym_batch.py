@@ -522,8 +522,15 @@ def prepare_task_package(task: TaskRef, task_root: Path, *, force: bool = False)
     state_dir = task_root / "state" / "trilane"
     marker = task_dir / ".prepared.json"
 
-    if force and task_dir.exists():
-        shutil.rmtree(task_dir, ignore_errors=True)
+    if force:
+        # 只重建源码与提示词；poc/ 与 artifacts/ 是历史证据，由 attempt 隔离
+        # 保证不污染本次 run，不能在这里整目录删掉。
+        if src_dir.exists():
+            shutil.rmtree(src_dir, ignore_errors=True)
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
     for path in (task_dir, src_dir, poc_dir, out_dir, state_dir):
         safe_mkdir(path)
 
@@ -770,6 +777,211 @@ def archive_attempt_outputs(task_root: Path, attempt: int) -> None:
             except OSError:
                 # 隔离失败不致命：退化为可能读到旧结果，但不阻断跑批。
                 pass
+
+
+def _attempt_dir(task_root: Path, attempt: int) -> Path:
+    """返回 attempt 的不可变产物目录；已存在时加时间戳后缀，绝不原地覆盖。"""
+    root = task_root / ARTIFACTS_DIR
+    candidate = root / f"attempt-{attempt}"
+    if candidate.exists():
+        candidate = root / f"attempt-{attempt}-{utc_stamp()}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _latest_attempt_dir(task_root: Path, attempt: int) -> Path | None:
+    matches = sorted(
+        (task_root / ARTIFACTS_DIR).glob(f"attempt-{attempt}*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+def _copy_poc_tree(task_root: Path, dest: Path) -> None:
+    poc_dir = task_root / "task" / "poc"
+    if not poc_dir.is_dir():
+        return
+    for source in poc_dir.rglob("*"):
+        if not source.is_file():
+            continue
+        target = dest / "poc" / source.relative_to(poc_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target)
+        except OSError:
+            continue
+
+
+def seal_attempt(
+    task_root: Path,
+    attempt: int,
+    *,
+    task: TaskRef | None = None,
+    result: dict | None = None,
+    candidates: list[PocCandidate] | None = None,
+    notes: dict | None = None,
+) -> Path:
+    """把本次 attempt 的产物快照到 artifacts/attempt-N，供续跑恢复与事后审计。"""
+    dest = _attempt_dir(task_root, attempt)
+    out_dir = task_root / "out"
+    for name in ("result.json", "report.md"):
+        source = out_dir / name
+        if source.is_file():
+            try:
+                shutil.copy2(source, dest / name)
+            except OSError:
+                continue
+    _copy_poc_tree(task_root, dest)
+
+    source_status = (result or {}).get("status")
+    if source_status is None:
+        try:
+            source_status = json.loads(
+                (out_dir / "result.json").read_text(encoding="utf-8", errors="replace")
+            ).get("status")
+        except (OSError, json.JSONDecodeError):
+            source_status = None
+
+    payload = {
+        "schema": 1,
+        "task_id": task.task_id if task else task_root.name,
+        "attempt": attempt,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_status": source_status,
+        "candidates": [
+            {
+                "file": candidate.path.relative_to(task_root).as_posix(),
+                "artifact_path": (
+                    (Path("poc") / candidate.path.relative_to(task_root / "task" / "poc"))
+                    .as_posix()
+                    if candidate.path.is_relative_to(task_root / "task" / "poc")
+                    else ""
+                ),
+                "sha256": candidate.sha256 or _sha256_file(candidate.path),
+                "role": candidate.role,
+                "source": candidate.source,
+                "finding": candidate.finding_id,
+                "verification": candidate.verification,
+                "observed_exit": candidate.observed_exit,
+            }
+            for candidate in (candidates or [])
+        ],
+        "notes": notes or {},
+    }
+    (dest / "attempt.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return dest
+
+
+def annotate_attempt_candidates(
+    task_root: Path,
+    attempt: int,
+    candidates: list[PocCandidate],
+    notes: dict | None = None,
+) -> None:
+    """把候选清单补写到本次 attempt 的目录（不修改 attempt.json）。"""
+    dest = _latest_attempt_dir(task_root, attempt)
+    if dest is None:
+        return
+    payload = {
+        "schema": 1,
+        "candidates": [
+            {
+                "file": candidate.path.relative_to(task_root).as_posix(),
+                "artifact_path": (
+                    (Path("poc") / candidate.path.relative_to(task_root / "task" / "poc"))
+                    .as_posix()
+                    if candidate.path.is_relative_to(task_root / "task" / "poc")
+                    else ""
+                ),
+                "sha256": candidate.sha256 or _sha256_file(candidate.path),
+                "role": candidate.role,
+                "source": candidate.source,
+                "finding": candidate.finding_id,
+                "verification": candidate.verification,
+                "observed_exit": candidate.observed_exit,
+            }
+            for candidate in candidates
+        ],
+        "notes": notes or {},
+    }
+    (dest / "candidates.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def restore_attempt_candidates(task_root: Path) -> int:
+    """从最新的 attempt 快照恢复候选文件；返回恢复数量。"""
+    root = task_root / ARTIFACTS_DIR
+    if not root.is_dir():
+        return 0
+    manifests = sorted(
+        list(root.glob("attempt-*/candidates.json"))
+        + list(root.glob("attempt-*/attempt.json")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for manifest in manifests:
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        restored = 0
+        for entry in payload.get("candidates") or []:
+            rel = str(entry.get("file") or "")
+            artifact_rel = str(entry.get("artifact_path") or "")
+            expected = str(entry.get("sha256") or "")
+            if not rel.startswith("task/poc/") or not artifact_rel:
+                continue
+            source = manifest.parent / artifact_rel
+            if not source.is_file():
+                continue
+            dest = task_root / rel
+            try:
+                if dest.is_file() and (
+                    not expected or _sha256_file(dest) == expected
+                ):
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest)
+                if expected and _sha256_file(dest) != expected:
+                    dest.unlink(missing_ok=True)
+                    continue
+                restored += 1
+            except OSError:
+                continue
+        if restored:
+            return restored
+    return 0
+
+
+def reset_poc_for_run(task_root: Path) -> Path | None:
+    """把进入本次 run 前的 poc/ 整体挪到 artifacts/orphan-poc-*，然后清空。
+
+    旧 attempt 的文件没有本次 run 的身份，不能参与候选；先复制再删除，保证可追溯。
+    """
+    poc_dir = task_root / "task" / "poc"
+    if not poc_dir.is_dir():
+        return None
+    files = [path for path in poc_dir.rglob("*") if path.is_file()]
+    if not files:
+        return None
+    dest = task_root / ARTIFACTS_DIR / f"orphan-poc-{utc_stamp()}"
+    for source in files:
+        target = dest / "poc" / source.relative_to(poc_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target)
+        except OSError:
+            continue
+    for source in files:
+        try:
+            source.unlink()
+        except OSError:
+            pass
+    return dest
 
 
 # --------------------------------------------------------------------------- #
@@ -1868,6 +2080,9 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         prepare_state_dir(task_root, Path(args.trilane_home).expanduser())
 
         log(f"[{task.task_id}] 启动智能体（超时 {args.timeout_sec}s）")
+        orphan = reset_poc_for_run(task_root)
+        if orphan is not None:
+            record["orphan_poc_archived"] = orphan.relative_to(task_root).as_posix()
         resume_log: list[dict] = []
         # 进程被重启（compose down/up、宿主重启、手动重跑）时，results.jsonl 里
         # 可能根本没有这条记录，重试循环不会触发。这里在**首轮之前**也查一次
@@ -1879,6 +2094,9 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 run_id, stage = point
                 archive_attempt_outputs(task_root, 0)
                 apply_resume_directive(task_root, run_id, stage)
+                restored = restore_attempt_candidates(task_root)
+                if restored:
+                    record["restored_candidates"] = restored
                 log(f"[{task.task_id}] 检测到上次中断于 {run_id}/{stage}，直接续跑")
                 resume_log.append(
                     {
@@ -1889,6 +2107,12 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                     }
                 )
         outcome = run_agent(task, task_root, args)
+        artifacts = record.setdefault("artifacts", [])
+        artifacts.append(
+            seal_attempt(task_root, 1, task=task, result=outcome.result)
+            .relative_to(task_root)
+            .as_posix()
+        )
         if resume_log:
             resume_log[-1]["outcome"] = outcome.status
         attempts = 1
@@ -1941,6 +2165,13 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 )
             time.sleep(wait)
             outcome = run_agent(task, task_root, args)
+            artifacts.append(
+                seal_attempt(
+                    task_root, attempts, task=task, result=outcome.result
+                )
+                .relative_to(task_root)
+                .as_posix()
+            )
             wall_clock += outcome.duration_sec
             if resume_log and resume_log[-1]["attempt"] == attempts:
                 resume_log[-1]["outcome"] = outcome.status
@@ -1976,6 +2207,10 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         ]
         if bundle_notes:
             record["bundle_notes"] = bundle_notes
+        if candidates:
+            annotate_attempt_candidates(
+                task_root, attempts, candidates, bundle_notes
+            )
         if not candidates:
             record.update(status="no_poc", submitted=None)
             return record
