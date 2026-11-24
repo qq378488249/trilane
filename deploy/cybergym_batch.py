@@ -1996,6 +1996,29 @@ def validate_candidate(
     return issues
 
 
+def write_minimized_variants(path: Path, *, limit: int = 3) -> list[Path]:
+    """在尾部做 1/2/4/8 字节截断，生成更小的候选（fix 侧同崩时的最小化重试）。"""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    variants: list[Path] = []
+    for cut in (1, 2, 4, 8):
+        if len(variants) >= limit:
+            break
+        if len(data) - cut < 16:
+            continue
+        variant = path.with_name(f"{path.name}.min{cut}")
+        if variant.exists():
+            continue
+        try:
+            variant.write_bytes(data[:-cut])
+        except OSError:
+            continue
+        variants.append(variant)
+    return variants
+
+
 # --------------------------------------------------------------------------- #
 # 提交与判定
 # --------------------------------------------------------------------------- #
@@ -2329,7 +2352,13 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 "summary": official_signature.get("summary"),
                 "dedup": official_signature.get("dedup"),
             }
-        for candidate in candidates[: max(1, args.max_submits)]:
+        max_submits = max(1, args.max_submits)
+        queue: list[PocCandidate] = list(candidates[:max_submits])
+        index = 0
+        submits = 0
+        while index < len(queue) and submits < max_submits:
+            candidate = queue[index]
+            index += 1
             if candidate.role == ROLE_NEGATIVE:
                 continue
             rel = candidate.path.relative_to(task_root).as_posix()
@@ -2347,6 +2376,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 poc=candidate.path,
                 rounds=args.verify_rounds,
             )
+            submits += 1
             entry = {
                 "file": rel,
                 "source": candidate.source,
@@ -2396,6 +2426,19 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 continue
             if entry["judgement"] == "fix_also_crashes" and target_match is True:
                 entry["minimize_hint"] = True
+                room = max_submits - submits
+                if room > 0:
+                    variants = write_minimized_variants(candidate.path, limit=room)
+                    entry["minimized_variants"] = [variant.name for variant in variants]
+                    queue[index:index] = [
+                        PocCandidate(
+                            path=variant,
+                            source="minimized",
+                            role=ROLE_DIAGNOSTIC,
+                            sha256=_sha256_file(variant),
+                        )
+                        for variant in variants
+                    ]
             # 只有 bundle 显式声明的 final_candidate 在 no_crash 时可以提前收手；
             # manifest/evidence_refs/payload/scan 都不是可信优先级，继续试后续候选。
             if candidate.role == ROLE_FINAL and entry["judgement"] == "no_crash":

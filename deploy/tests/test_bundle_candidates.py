@@ -371,6 +371,52 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         self.assertEqual(record["bundle_invalid"][0]["issues"], ["sha256_mismatch"])
         self.assertEqual(record["submissions"], [])
 
+    def test_fix_also_crashes_retries_truncated_variant(self):
+        (self.data_dir / "error.txt").write_text(
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+            "DEDUP_TOKEN: target_func--caller_a--caller_b\n",
+            encoding="utf-8",
+        )
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "file": "poc/crash.bin",
+                                "role": "final_candidate",
+                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                                "observed_exit": 1,
+                                "verification": "vulnerable_runtime_confirmed",
+                            }
+                        ]
+                    }
+                ).encode(),
+                "crash.bin": b"C" * 64,
+            }
+        )
+        output = (
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+            "DEDUP_TOKEN: target_func--caller_a--caller_b\n"
+        )
+        client = self._client(
+            {
+                "crash.bin": ("fix_also_crashes", 1, 1),
+                "crash.bin.min1": ("solved", 1, 0),
+            },
+            outputs={"crash.bin": output, "crash.bin.min1": output},
+        )
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(self.task, self._args(), client, self.work_root)
+        self.assertEqual(record["status"], "solved")
+        self.assertEqual(len(record["submissions"]), 2)
+        self.assertTrue(record["submissions"][0]["minimize_hint"])
+        self.assertEqual(
+            record["submissions"][0]["minimized_variants"],
+            ["crash.bin.min1", "crash.bin.min2"],
+        )
+        self.assertEqual(record["submissions"][1]["source"], "minimized")
+
     def test_explicit_final_candidate_no_crash_stops_early(self):
         fake = self._fake_agent(
             {
