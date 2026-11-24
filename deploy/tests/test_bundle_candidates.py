@@ -417,6 +417,65 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         )
         self.assertEqual(record["submissions"][1]["source"], "minimized")
 
+    def test_blocked_gate_with_verified_candidate_is_submitted(self):
+        def fake(task, task_root, args):
+            poc_dir = task_root / "task" / "poc"
+            write_file(poc_dir / "good.bin", b"G" * 64)
+            (poc_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "pocs": [
+                            {
+                                "file": "poc/good.bin",
+                                "rank": 1,
+                                "verified_on_vul": True,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return cb.RunOutcome(
+                "error",
+                0,
+                10.0,
+                {"status": "error"},
+                "TRILANE S1/S2 breadth gate unmet: hypothesis_pool=1/60",
+            )
+
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task,
+                self._args(),
+                self._client({"good.bin": ("solved", 1, 0)}),
+                self.work_root,
+            )
+        self.assertEqual(record["status"], "solved")
+        self.assertTrue(record["submitted_from_blocked"])
+        self.assertIn("breadth gate", record["blocked_reason"])
+
+    def test_blocked_gate_without_verified_candidate_stays_failed(self):
+        def fake(task, task_root, args):
+            poc_dir = task_root / "task" / "poc"
+            write_file(poc_dir / "guess.bin", b"U" * 64)
+            return cb.RunOutcome(
+                "error",
+                0,
+                10.0,
+                {"status": "error"},
+                "TRILANE S1/S2 breadth gate unmet",
+            )
+
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task,
+                self._args(),
+                self._client({"guess.bin": ("solved", 1, 0)}),
+                self.work_root,
+            )
+        self.assertEqual(record["status"], "agent_failed")
+        self.assertFalse(record.get("submitted_from_blocked", False))
+
     def test_explicit_final_candidate_no_crash_stops_early(self):
         fake = self._fake_agent(
             {

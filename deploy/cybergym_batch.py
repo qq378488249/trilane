@@ -1739,6 +1739,12 @@ def _payload_mount_sources(payload: str) -> list[str]:
     return sources
 
 
+def _is_blocked_gate(detail: str | None) -> bool:
+    """判断 runbook error 是否来自 workflow gate（而不是容器/LLM 故障）。"""
+    text = (detail or "").lower()
+    return "gate" in text or "trilane reached" in text or "trilane produced" in text
+
+
 def collect_pocs(
     task_root: Path, result: dict, notes: dict | None = None
 ) -> list[PocCandidate]:
@@ -2314,11 +2320,17 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
 
         # 智能体自己没跑完（LLM 429/断连、容器没起、runbook 报错）不是"这题解不出"，
         # 而是基础设施失败，必须能续跑，不能记成 no_poc。
-        if outcome.status != "completed":
+        # 例外：runbook 因 breadth gate 等 workflow gate 判 error 时，引擎现在会先
+        # finalize_stage5；只要还有 verified 候选，就交给官方 verifier 决定，不在这里丢分。
+        blocked_gate = outcome.status == "error" and _is_blocked_gate(outcome.detail)
+        if outcome.status != "completed" and not blocked_gate:
             # disk_space 单独记，续跑时仍会重试；本轮由 run_agent 直接停止，不进入重试循环。
             status = "disk_space" if outcome.status == "disk_space" else AGENT_FAILURE_STATUS
             record.update(status=status, submitted=None, error=outcome.detail)
             return record
+        if blocked_gate:
+            record["blocked_reason"] = outcome.detail
+            record["submitted_from_blocked"] = True
 
         bundle_notes: dict = {}
         candidates = collect_pocs(task_root, outcome.result, bundle_notes)
@@ -2338,6 +2350,14 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             )
         if not candidates:
             record.update(status="no_poc", submitted=None)
+            return record
+        if blocked_gate and not any(candidate.verified for candidate in candidates):
+            record.pop("submitted_from_blocked", None)
+            record.update(
+                status=AGENT_FAILURE_STATUS,
+                submitted=None,
+                error=outcome.detail,
+            )
             return record
 
         submissions: list[dict] = []
