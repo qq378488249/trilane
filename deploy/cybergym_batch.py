@@ -69,8 +69,41 @@ NON_CRASH_EXITS = frozenset({0, 124, 137, 300, 999})
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
-# 文件名里带这些词的通常是"对照组"，排序时排在真候选之后。
-CONTROL_HINTS = ("control", "benign", "clean", "negative")
+# 文件名里带这些词的通常是"对照组"或握手/基线输入，排序时排在真候选之后。
+CONTROL_HINTS = (
+    "control",
+    "benign",
+    "clean",
+    "negative",
+    "0_hello",
+    "1_open",
+    "2_get",
+    "3_find",
+    "4_close",
+    "baseline",
+    "empty_input",
+    "client_helopn",
+)
+
+# 结构化工件：agent 或引擎在 task/poc 下写 bundle.json，声明候选角色与证据。
+BUNDLE_FILE = "bundle.json"
+ARTIFACTS_DIR = "artifacts"
+
+ROLE_FINAL = "final_candidate"
+ROLE_CANDIDATE = "candidate"
+ROLE_DIAGNOSTIC = "diagnostic"
+ROLE_NEGATIVE = "negative_control"
+ROLE_SCAN = "scan_unknown"
+VALID_ROLES = frozenset(
+    {ROLE_FINAL, ROLE_CANDIDATE, ROLE_DIAGNOSTIC, ROLE_NEGATIVE, ROLE_SCAN}
+)
+ROLE_RANK = {
+    ROLE_FINAL: 0,
+    ROLE_CANDIDATE: 1,
+    ROLE_DIAGNOSTIC: 4,
+    ROLE_NEGATIVE: 5,
+    ROLE_SCAN: 9,
+}
 
 LEVEL1_FILES = ("repo-vul.tar.gz", "description.txt")
 # 数据目录里这些是 level2/3 或 fix 侧材料，进任务包就是违规。
@@ -1413,53 +1446,164 @@ class PocCandidate:
     confidence: str = ""
     verified: bool = False
     root_cause: str = ""
-    source: str = ""  # manifest / evidence_refs / scan
+    source: str = ""  # bundle / manifest / evidence_refs / payload / scan
+    role: str = ""
+    sha256: str = ""
+    family: str = ""
+    replay: str = ""
+    verification: str = ""
+    observed_exit: int | None = None
+    notes: list[str] = field(default_factory=list)
 
     def sort_key(self) -> tuple:
         name = self.path.name.lower()
-        # 对照组输入几乎必然 no_crash，提交它们只是白烧一次尝试，一律沉底。
+        # 对照组/握手输入几乎必然 no_crash，提交它们只是白烧一次尝试，一律沉底。
         control = 1 if any(hint in name for hint in CONTROL_HINTS) else 0
-        # manifest 是智能体自己声明的优先级，压过我们从 findings 推断的 severity。
-        from_manifest = 0 if self.source == "manifest" else 1
+        # 结构化 bundle 显式声明的角色优先；扫描来源永远沉底。
+        role = ROLE_RANK.get(self.role, ROLE_RANK[ROLE_SCAN])
         return (
             control,
-            from_manifest,
+            role,
+            0 if self.verified else 1,
             self.rank_hint,
             SEVERITY_RANK.get(self.severity.lower(), 9),
             CONFIDENCE_RANK.get(self.confidence.lower(), 9),
-            0 if self.verified else 1,
             name,
         )
 
 
-def collect_pocs(task_root: Path, result: dict) -> list[PocCandidate]:
-    """按 manifest > findings 的 evidence_refs > 目录扫描 的优先级收集候选 PoC。"""
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _note(notes: dict, kind: str, value: str) -> None:
+    notes.setdefault(kind, []).append(value)
+
+
+def _candidate_path(
+    task_root: Path, rel: str, *, base: str | None = None
+) -> Path | None:
+    """解析候选路径并限制在 task root 内；越界或不存在返回 None。"""
+    text = str(rel or "").strip()
+    if not text:
+        return None
+    roots = [task_root]
+    if base:
+        roots.insert(0, task_root / base)
+    for root in roots:
+        try:
+            path = (root / text).resolve()
+            path.relative_to(task_root.resolve())
+        except (OSError, ValueError):
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
+def _payload_mount_sources(payload: str) -> list[str]:
+    """从 finding.payload 的 docker run 里取 `-v/--volume host:container` 的 host。
+
+    正则优先：Windows 宿主路径的反斜杠在 shlex POSIX 模式下会被当转义，
+    而 replay 里的挂载参数本身不含空格，正则足够；引号只做简单剥离。
+    """
+    sources: list[str] = []
+    for match in re.finditer(
+        r"(?:^|\s)(?:-v|--volume)(?:=|\s+)(?P<value>[^\s]+)", payload
+    ):
+        value = match.group("value").strip("'\"")
+        # 容器目标是固定的 /tmp/poc；按它切分才能兼容 Windows 宿主路径里的盘符冒号。
+        if ":/tmp/poc" in value:
+            source = value.split(":/tmp/poc", 1)[0]
+        else:
+            source = value.rsplit(":", 1)[0]
+        if source and source not in sources:
+            sources.append(source)
+    return sources
+
+
+def collect_pocs(
+    task_root: Path, result: dict, notes: dict | None = None
+) -> list[PocCandidate]:
+    """按 bundle > manifest > evidence_refs > payload > 目录扫描 收集候选。
+
+    `notes` 回传被拒绝/缺失的候选（missing_payload、sha256_mismatch 等），
+    由调用方写进 results.jsonl，绝不静默丢弃。
+    """
+    notes = notes if notes is not None else {}
     poc_dir = task_root / "task" / "poc"
     out_dir = task_root / "out"
     found: dict[Path, PocCandidate] = {}
 
+    # 1) 结构化 bundle：唯一能声明 role=final_candidate 的来源。
+    bundle_path = poc_dir / BUNDLE_FILE
+    if bundle_path.is_file():
+        try:
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            bundle = {}
+            _note(notes, "invalid_bundle", str(bundle_path.relative_to(task_root)))
+        for idx, entry in enumerate(bundle.get("candidates") or []):
+            rel = str(entry.get("file") or "").strip()
+            path = _candidate_path(task_root, rel, base="task")
+            if path is None:
+                _note(notes, "missing_candidate", rel)
+                continue
+            role = str(entry.get("role") or ROLE_CANDIDATE).strip()
+            if role not in VALID_ROLES:
+                _note(notes, "invalid_role", f"{rel}:{role}")
+                role = ROLE_DIAGNOSTIC
+            actual = _sha256_file(path)
+            declared = str(entry.get("sha256") or "").strip().lower()
+            if declared and declared != actual:
+                _note(notes, "sha256_mismatch", rel)
+            found[path] = PocCandidate(
+                path=path,
+                finding_id=str(entry.get("finding") or ""),
+                rank_hint=int(entry.get("rank") or idx + 1),
+                verified=str(entry.get("verification") or "").lower()
+                in ("verified", "vulnerable_runtime_confirmed", "differential_verified"),
+                root_cause=str(entry.get("root_cause") or ""),
+                source="bundle",
+                role=role,
+                sha256=actual,
+                family=str(entry.get("family") or ""),
+                replay=str(entry.get("replay") or ""),
+                verification=str(entry.get("verification") or ""),
+                observed_exit=entry.get("observed_exit"),
+            )
+
+    # 2) manifest：agent 声明的优先级，但没有显式角色，不能获得提前结束特权。
     manifest = poc_dir / "manifest.json"
-    if manifest.exists():
+    if manifest.is_file():
         try:
             data = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
         except json.JSONDecodeError:
             data = {}
         for idx, entry in enumerate(data.get("pocs") or []):
             rel = str(entry.get("file") or "").strip()
-            if not rel:
+            path = _candidate_path(task_root, rel, base="task")
+            if path is None:
+                _note(notes, "missing_manifest_candidate", rel)
                 continue
-            path = (task_root / "task" / rel).resolve()
-            if path.is_file():
-                found[path] = PocCandidate(
-                    path=path,
-                    finding_id=str(entry.get("finding") or ""),
-                    rank_hint=int(entry.get("rank") or idx + 1),
-                    verified=bool(entry.get("verified_on_vul")),
-                    root_cause=str(entry.get("root_cause") or ""),
-                    source="manifest",
-                )
+            if path in found:
+                continue
+            found[path] = PocCandidate(
+                path=path,
+                finding_id=str(entry.get("finding") or ""),
+                rank_hint=int(entry.get("rank") or idx + 1),
+                verified=bool(entry.get("verified_on_vul")),
+                root_cause=str(entry.get("root_cause") or ""),
+                source="manifest",
+                role=ROLE_CANDIDATE,
+                sha256=_sha256_file(path),
+            )
 
-    # findings 里的 evidence_refs 形如 "poc/cdf_x.cfb, rv.log ..."
+    # 3) findings 里的 evidence_refs，形如 "poc/cdf_x.cfb, rv.log ..."。
     for finding in result.get("findings") or []:
         refs = str(finding.get("description") or "")
         match = re.search(r"evidence_refs=([^\n]*)", refs)
@@ -1469,8 +1613,8 @@ def collect_pocs(task_root: Path, result: dict) -> list[PocCandidate]:
             token = token.strip()
             if not token.startswith("poc/"):
                 continue
-            path = (task_root / "task" / token).resolve()
-            if not path.is_file() or path in found:
+            path = _candidate_path(task_root, token, base="task")
+            if path is None or path in found:
                 continue
             found[path] = PocCandidate(
                 path=path,
@@ -1480,8 +1624,35 @@ def collect_pocs(task_root: Path, result: dict) -> list[PocCandidate]:
                 verified=str(finding.get("status") or "").lower() == "verified",
                 root_cause=str(finding.get("location") or ""),
                 source="evidence_refs",
+                role=ROLE_DIAGNOSTIC,
+                sha256=_sha256_file(path),
             )
 
+    # 4) payload 兼容兜底：只认 docker run 里 -v/--volume 的宿主路径，且必须在 task root 内。
+    for finding in result.get("findings") or []:
+        payload = str(finding.get("payload") or "")
+        if not payload:
+            continue
+        for source_path in _payload_mount_sources(payload):
+            path = _candidate_path(task_root, source_path, base="task")
+            if path is None:
+                _note(notes, "missing_payload", source_path)
+                continue
+            if path in found:
+                continue
+            found[path] = PocCandidate(
+                path=path,
+                finding_id=str(finding.get("id") or ""),
+                severity=str(finding.get("severity") or ""),
+                confidence=str(finding.get("confidence") or ""),
+                verified=str(finding.get("status") or "").lower() == "verified",
+                root_cause=str(finding.get("location") or ""),
+                source="payload",
+                role=ROLE_DIAGNOSTIC,
+                sha256=_sha256_file(path),
+            )
+
+    # 5) 目录扫描只作诊断：跳过过小文件与已知控制/握手输入。
     for directory in (poc_dir, out_dir):
         if not directory.is_dir():
             continue
@@ -1490,7 +1661,23 @@ def collect_pocs(task_root: Path, result: dict) -> list[PocCandidate]:
                 continue
             if path.suffix in SCAN_SKIP_SUFFIXES or path.name in SCAN_SKIP_NAMES:
                 continue
-            found[path] = PocCandidate(path=path, source="scan")
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            rel = str(path.relative_to(task_root))
+            if size < 16:
+                _note(notes, "scan_too_small", rel)
+                continue
+            if any(hint in path.name.lower() for hint in CONTROL_HINTS):
+                _note(notes, "scan_control_skipped", rel)
+                continue
+            found[path] = PocCandidate(
+                path=path,
+                source="scan",
+                role=ROLE_SCAN,
+                sha256=_sha256_file(path),
+            )
 
     return sorted(found.values(), key=lambda c: c.sort_key())
 
@@ -1777,16 +1964,30 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             record.update(status=status, submitted=None, error=outcome.detail)
             return record
 
-        candidates = collect_pocs(task_root, outcome.result)
-        record["poc_candidates"] = [str(c.path.relative_to(task_root)) for c in candidates[:10]]
+        bundle_notes: dict = {}
+        candidates = collect_pocs(task_root, outcome.result, bundle_notes)
+        record["poc_candidates"] = [
+            {
+                "file": candidate.path.relative_to(task_root).as_posix(),
+                "role": candidate.role,
+                "source": candidate.source,
+            }
+            for candidate in candidates[:10]
+        ]
+        if bundle_notes:
+            record["bundle_notes"] = bundle_notes
         if not candidates:
             record.update(status="no_poc", submitted=None)
             return record
 
         submissions: list[dict] = []
         final: dict | None = None
+        terminal = ""
+        best_evidence: dict | None = None
         for candidate in candidates[: max(1, args.max_submits)]:
-            rel = str(candidate.path.relative_to(task_root))
+            if candidate.role == ROLE_NEGATIVE:
+                continue
+            rel = candidate.path.relative_to(task_root).as_posix()
             outcome_eval = client.evaluate(
                 masked_id=task.masked_id,
                 real_task_id=task.task_id,
@@ -1796,6 +1997,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             entry = {
                 "file": rel,
                 "source": candidate.source,
+                "role": candidate.role,
                 "finding": candidate.finding_id,
                 "judgement": outcome_eval["judgement"],
                 "tally": outcome_eval["tally"],
@@ -1810,21 +2012,36 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             }
             submissions.append(entry)
 
-            # 只有多数票"解出"才算命中。unstable（平票）说明这份输入本身不稳定，
-            # 继续试下一个候选，而不是赌一次运气。
+            verdicts = [
+                judge(row["vul_exit_code"], row["fix_exit_code"])
+                for row in outcome_eval["rounds"]
+            ]
             if entry["judgement"] == "solved":
                 final = entry
+                terminal = "solved"
                 break
-            verdicts = set(outcome_eval["rounds"] and [
-                judge(r["vul_exit_code"], r["fix_exit_code"]) for r in outcome_eval["rounds"]
-            ])
-            if not (verdicts & {"fix_also_crashes", "unstable"}):
-                # vul 侧根本没崩，后面的候选也不必再试
+
+            terminal = entry["judgement"]
+            if best_evidence is None and any(
+                cur != "no_crash" for cur in verdicts
+            ):
+                best_evidence = entry
+            # 只有 bundle 显式声明的 final_candidate 在 no_crash 时可以提前收手；
+            # manifest/evidence_refs/payload/scan 都不是可信优先级，继续试后续候选。
+            if candidate.role == ROLE_FINAL and entry["judgement"] == "no_crash":
                 break
 
         record["submissions"] = submissions
+        record["terminal_status"] = terminal or "no_crash"
+        if best_evidence is not None:
+            record["best_evidence"] = {
+                "file": best_evidence.get("file"),
+                "finding": best_evidence.get("finding"),
+                "judgement": best_evidence.get("judgement"),
+                "role": best_evidence.get("role"),
+            }
         if final is None:
-            record.update(status=submissions[-1]["judgement"] if submissions else "no_crash", submitted=None)
+            record.update(status=terminal or "no_crash", submitted=None)
             return record
         record.update(status="solved", submitted=final, fix_verified=True)
         return record
