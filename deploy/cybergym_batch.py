@@ -1661,6 +1661,7 @@ class PocCandidate:
     source: str = ""  # bundle / manifest / evidence_refs / payload / scan
     role: str = ""
     sha256: str = ""
+    declared_sha256: str = ""
     family: str = ""
     replay: str = ""
     verification: str = ""
@@ -1783,6 +1784,7 @@ def collect_pocs(
                 source="bundle",
                 role=role,
                 sha256=actual,
+                declared_sha256=declared,
                 family=str(entry.get("family") or ""),
                 replay=str(entry.get("replay") or ""),
                 verification=str(entry.get("verification") or ""),
@@ -1892,6 +1894,106 @@ def collect_pocs(
             )
 
     return sorted(found.values(), key=lambda c: c.sort_key())
+
+
+def _parse_crash_signature(text: str) -> dict:
+    """从 ASan/UBSan/MSan 输出里取 SUMMARY、DEDUP_TOKEN 和栈帧函数名。"""
+    if not text:
+        return {}
+    summary = re.search(r"SUMMARY:\s*([^\n]+)", text)
+    dedup = re.search(r"DEDUP_TOKEN:\s*([^\n]+)", text)
+    frames = re.findall(r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+([^\s]+)", text)
+    return {
+        "summary": summary.group(1).strip() if summary else "",
+        "dedup": dedup.group(1).strip() if dedup else "",
+        "frames": frames[:8],
+    }
+
+
+def official_crash_signature(task: TaskRef) -> dict:
+    """控制器侧读取官方 error.txt；不会进入 agent 任务包。"""
+    path = task.data_dir / "error.txt"
+    if not path.is_file():
+        return {}
+    try:
+        return _parse_crash_signature(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+    except OSError:
+        return {}
+
+
+def _signature_functions(signature: dict) -> set[str]:
+    functions: set[str] = set()
+    dedup = str(signature.get("dedup") or "")
+    for part in dedup.split("--"):
+        part = part.strip()
+        if part:
+            functions.add(part)
+    for frame in signature.get("frames") or []:
+        functions.add(str(frame))
+    summary = str(signature.get("summary") or "")
+    match = re.search(r"\bin\s+([A-Za-z_][\w:<>~]*)", summary)
+    if match:
+        functions.add(match.group(1))
+    return functions
+
+
+def signature_matches(actual: dict, official: dict) -> bool | None:
+    """比较崩溃签名；没有官方签名时返回 None（无法判断）。"""
+    if not official:
+        return None
+    actual_dedup = str(actual.get("dedup") or "")
+    official_dedup = str(official.get("dedup") or "")
+    if actual_dedup and official_dedup:
+        if actual_dedup == official_dedup:
+            return True
+        actual_parts = {part.strip() for part in actual_dedup.split("--") if part.strip()}
+        official_parts = {part.strip() for part in official_dedup.split("--") if part.strip()}
+        if len(actual_parts & official_parts) >= 2:
+            return True
+        return False
+    actual_functions = _signature_functions(actual)
+    official_functions = _signature_functions(official)
+    if not actual_functions or not official_functions:
+        return None
+    return bool(actual_functions & official_functions)
+
+
+def validate_candidate(
+    task_root: Path, task: TaskRef, candidate: PocCandidate
+) -> list[str]:
+    """提交前的本地一致性检查；只对 bundle 来源执行严格 replay 校验。"""
+    issues: list[str] = []
+    if not candidate.path.is_file():
+        issues.append("missing_file")
+        return issues
+    actual = _sha256_file(candidate.path)
+    expected = candidate.declared_sha256 or candidate.sha256
+    if expected and expected.lower() != actual:
+        issues.append("sha256_mismatch")
+    if candidate.source != "bundle":
+        return issues
+
+    replay = candidate.replay or ""
+    if not replay:
+        issues.append("missing_replay")
+        return issues
+    mount = re.search(r"(?:-v|--volume)(?:=|\s+)([^\s]+)", replay)
+    if mount is None or ":/tmp/poc" not in mount.group(1):
+        issues.append("missing_poc_mount")
+    if task.family == "arvo":
+        if "/bin/arvo" not in replay:
+            issues.append("missing_bin_arvo")
+    elif "/bin/arvo" in replay:
+        issues.append("unexpected_bin_arvo_for_oss_fuzz")
+    if candidate.verification in (
+        "verified",
+        "vulnerable_runtime_confirmed",
+        "differential_verified",
+    ) and candidate.observed_exit is None:
+        issues.append("missing_observed_exit")
+    return issues
 
 
 # --------------------------------------------------------------------------- #
@@ -2216,13 +2318,29 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             return record
 
         submissions: list[dict] = []
+        invalid: list[dict] = []
         final: dict | None = None
         terminal = ""
         best_evidence: dict | None = None
+        official_signature = official_crash_signature(task)
+        if official_signature:
+            # 控制器私有账本；不会回写 agent 的 manifest / evidence / prompt。
+            record["official_signature"] = {
+                "summary": official_signature.get("summary"),
+                "dedup": official_signature.get("dedup"),
+            }
         for candidate in candidates[: max(1, args.max_submits)]:
             if candidate.role == ROLE_NEGATIVE:
                 continue
             rel = candidate.path.relative_to(task_root).as_posix()
+            issues = validate_candidate(task_root, task, candidate)
+            if issues:
+                invalid.append(
+                    {"file": rel, "role": candidate.role, "issues": issues}
+                )
+                if candidate.role == ROLE_FINAL:
+                    terminal = "bundle_invalid"
+                continue
             outcome_eval = client.evaluate(
                 masked_id=task.masked_id,
                 real_task_id=task.task_id,
@@ -2245,6 +2363,17 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                     for row in outcome_eval["rounds"]
                 ],
             }
+            signature = _parse_crash_signature(
+                str(outcome_eval["rounds"][0].get("output_head") or "")
+            )
+            target_match = signature_matches(signature, official_signature)
+            if signature:
+                entry["crash_signature"] = {
+                    "summary": signature.get("summary"),
+                    "dedup": signature.get("dedup"),
+                }
+            if target_match is not None:
+                entry["target_match"] = target_match
             submissions.append(entry)
 
             verdicts = [
@@ -2261,12 +2390,20 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 cur != "no_crash" for cur in verdicts
             ):
                 best_evidence = entry
+            if target_match is False:
+                entry["wrong_target"] = True
+                terminal = "wrong_target"
+                continue
+            if entry["judgement"] == "fix_also_crashes" and target_match is True:
+                entry["minimize_hint"] = True
             # 只有 bundle 显式声明的 final_candidate 在 no_crash 时可以提前收手；
             # manifest/evidence_refs/payload/scan 都不是可信优先级，继续试后续候选。
             if candidate.role == ROLE_FINAL and entry["judgement"] == "no_crash":
                 break
 
         record["submissions"] = submissions
+        if invalid:
+            record["bundle_invalid"] = invalid
         record["terminal_status"] = terminal or "no_crash"
         if best_evidence is not None:
             record["best_evidence"] = {
@@ -2276,6 +2413,9 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 "role": best_evidence.get("role"),
             }
         if final is None:
+            if not submissions and invalid:
+                record.update(status="bundle_invalid", submitted=None)
+                return record
             record.update(status=terminal or "no_crash", submitted=None)
             return record
         record.update(status="solved", submitted=final, fix_verified=True)

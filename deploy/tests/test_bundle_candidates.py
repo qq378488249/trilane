@@ -209,7 +209,13 @@ class RunOneCandidateLoopTests(unittest.TestCase):
 
         return fake
 
-    def _client(self, judgements: dict[str, tuple[str, int, int]]):
+    def _client(
+        self,
+        judgements: dict[str, tuple[str, int, int]],
+        outputs: dict[str, str] | None = None,
+    ):
+        outputs = outputs or {}
+
         class FakeClient:
             def evaluate(self, *, masked_id, real_task_id, poc, rounds):
                 judgement, vul_exit, fix_exit = judgements[poc.name]
@@ -218,7 +224,7 @@ class RunOneCandidateLoopTests(unittest.TestCase):
                         "poc_id": f"poc-{poc.name}-{index}",
                         "vul_exit_code": vul_exit,
                         "fix_exit_code": fix_exit,
-                        "output_head": "",
+                        "output_head": outputs.get(poc.name, ""),
                     }
                     for index in range(rounds)
                 ]
@@ -231,19 +237,20 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         return FakeClient()
 
     def test_continues_after_no_crash_and_solves_later_candidate(self):
-        (self.work_root / "arvo_3938" / "task" / "poc").mkdir(parents=True, exist_ok=True)
-        (self.work_root / "arvo_3938" / "task" / "poc" / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "pocs": [
-                        {"file": "poc/bad.bin", "rank": 1},
-                        {"file": "poc/good.bin", "rank": 2},
-                    ]
-                }
-            ),
-            encoding="utf-8",
+        fake = self._fake_agent(
+            {
+                "manifest.json": json.dumps(
+                    {
+                        "pocs": [
+                            {"file": "poc/bad.bin", "rank": 1},
+                            {"file": "poc/good.bin", "rank": 2},
+                        ]
+                    }
+                ).encode(),
+                "bad.bin": b"B" * 64,
+                "good.bin": b"G" * 64,
+            }
         )
-        fake = self._fake_agent({"bad.bin": b"B" * 64, "good.bin": b"G" * 64})
         with mock.patch.object(cb, "run_agent", fake):
             record = cb.run_one(
                 self.task,
@@ -257,20 +264,19 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         self.assertEqual(len(record["submissions"]), 2)
 
     def test_terminal_status_and_best_evidence_are_recorded(self):
-        (self.work_root / "arvo_3938" / "task" / "poc").mkdir(parents=True, exist_ok=True)
-        (self.work_root / "arvo_3938" / "task" / "poc" / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "pocs": [
-                        {"file": "poc/fix_crash.bin", "rank": 1},
-                        {"file": "poc/no_crash.bin", "rank": 2},
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
         fake = self._fake_agent(
-            {"fix_crash.bin": b"F" * 64, "no_crash.bin": b"N" * 64}
+            {
+                "manifest.json": json.dumps(
+                    {
+                        "pocs": [
+                            {"file": "poc/fix_crash.bin", "rank": 1},
+                            {"file": "poc/no_crash.bin", "rank": 2},
+                        ]
+                    }
+                ).encode(),
+                "fix_crash.bin": b"F" * 64,
+                "no_crash.bin": b"N" * 64,
+            }
         )
         with mock.patch.object(cb, "run_agent", fake):
             record = cb.run_one(
@@ -289,20 +295,97 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         self.assertEqual(record["best_evidence"]["file"], "task/poc/fix_crash.bin")
         self.assertEqual(len(record["submissions"]), 2)
 
-    def test_explicit_final_candidate_no_crash_stops_early(self):
-        (self.work_root / "arvo_3938" / "task" / "poc").mkdir(parents=True, exist_ok=True)
-        (self.work_root / "arvo_3938" / "task" / "poc" / cb.BUNDLE_FILE).write_text(
-            json.dumps(
-                {
-                    "candidates": [
-                        {"file": "poc/final.bin", "role": "final_candidate"},
-                        {"file": "poc/other.bin", "role": "candidate"},
-                    ]
-                }
-            ),
+    def test_wrong_target_continues_to_next_candidate(self):
+        (self.data_dir / "error.txt").write_text(
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+            "DEDUP_TOKEN: target_func--caller_a--caller_b\n",
             encoding="utf-8",
         )
-        fake = self._fake_agent({"final.bin": b"F" * 64, "other.bin": b"O" * 64})
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {"file": "poc/wrong.bin", "role": "candidate", "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo"},
+                            {"file": "poc/right.bin", "role": "candidate", "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo"},
+                        ]
+                    }
+                ).encode(),
+                "wrong.bin": b"W" * 64,
+                "right.bin": b"R" * 64,
+            }
+        )
+        client = self._client(
+            {
+                "wrong.bin": ("fix_also_crashes", 1, 1),
+                "right.bin": ("solved", 1, 0),
+            },
+            outputs={
+                "wrong.bin": (
+                    "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/y.c:20 in other_func\n"
+                    "DEDUP_TOKEN: other_func--caller_c--caller_d\n"
+                ),
+                "right.bin": (
+                    "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+                    "DEDUP_TOKEN: target_func--caller_a--caller_b\n"
+                ),
+            },
+        )
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(self.task, self._args(), client, self.work_root)
+        self.assertEqual(record["status"], "solved")
+        self.assertEqual(len(record["submissions"]), 2)
+        self.assertFalse(record["submissions"][0]["target_match"])
+        self.assertTrue(record["submissions"][0]["wrong_target"])
+        self.assertTrue(record["submissions"][1]["target_match"])
+
+    def test_bundle_invalid_candidate_is_not_submitted(self):
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "file": "poc/final.bin",
+                                "role": "final_candidate",
+                                "sha256": "0" * 64,
+                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                                "observed_exit": 1,
+                            }
+                        ]
+                    }
+                ).encode(),
+                "final.bin": b"F" * 64,
+            }
+        )
+
+        class ExplodingClient:
+            def evaluate(self, **_kwargs):
+                raise AssertionError("invalid bundle must not be submitted")
+
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task, self._args(), ExplodingClient(), self.work_root
+            )
+        self.assertEqual(record["status"], "bundle_invalid")
+        self.assertEqual(record["bundle_invalid"][0]["issues"], ["sha256_mismatch"])
+        self.assertEqual(record["submissions"], [])
+
+    def test_explicit_final_candidate_no_crash_stops_early(self):
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {"file": "poc/final.bin", "role": "final_candidate", "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo"},
+                            {"file": "poc/other.bin", "role": "candidate", "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo"},
+                        ]
+                    }
+                ).encode(),
+                "final.bin": b"F" * 64,
+                "other.bin": b"O" * 64,
+            }
+        )
         with mock.patch.object(cb, "run_agent", fake):
             record = cb.run_one(
                 self.task,
@@ -317,6 +400,106 @@ class RunOneCandidateLoopTests(unittest.TestCase):
             )
         self.assertEqual(record["status"], "no_crash")
         self.assertEqual(len(record["submissions"]), 1)
+
+
+class CrashSignatureTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.task_root = build_task_root(Path(self._tmp.name))
+        self.path = write_file(
+            self.task_root / "task" / "poc" / "x.bin", b"X" * 64
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_parse_signature(self):
+        signature = cb._parse_crash_signature(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+            "    #0 0x4a0123 in target_func /src/x.c:10:2\n"
+            "    #1 0x4a0456 in caller_a /src/x.c:20:1\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+            "DEDUP_TOKEN: target_func--caller_a--caller_b\n"
+        )
+        self.assertIn("target_func", signature["summary"])
+        self.assertEqual(signature["dedup"], "target_func--caller_a--caller_b")
+        self.assertEqual(signature["frames"][:2], ["target_func", "caller_a"])
+
+    def test_signature_match_and_mismatch(self):
+        official = {
+            "summary": "AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func",
+            "dedup": "target_func--caller_a--caller_b",
+            "frames": ["target_func"],
+        }
+        self.assertTrue(
+            cb.signature_matches(
+                {"dedup": "target_func--caller_a--caller_b", "frames": []}, official
+            )
+        )
+        self.assertFalse(
+            cb.signature_matches(
+                {"dedup": "other_func--caller_c--caller_d", "frames": []}, official
+            )
+        )
+        self.assertIsNone(cb.signature_matches({"dedup": "x"}, {}))
+
+    def _candidate(self, **overrides) -> cb.PocCandidate:
+        values = {
+            "path": self.path,
+            "source": "bundle",
+            "role": cb.ROLE_FINAL,
+            "sha256": cb._sha256_file(self.path),
+            "observed_exit": 1,
+            "verification": "vulnerable_runtime_confirmed",
+            "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+        }
+        values.update(overrides)
+        return cb.PocCandidate(**values)
+
+    def test_validate_arvo_candidate(self):
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
+        )
+        self.assertEqual(cb.validate_candidate(self.task_root, task, self._candidate()), [])
+
+    def test_validate_rejects_missing_mount_and_entrypoint(self):
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
+        )
+        missing_mount = self._candidate(
+            replay="docker run img /bin/arvo"
+        )
+        self.assertIn(
+            "missing_poc_mount", cb.validate_candidate(self.task_root, task, missing_mount)
+        )
+        missing_bin = self._candidate(
+            replay="docker run -v /poc:/tmp/poc:ro img"
+        )
+        self.assertIn(
+            "missing_bin_arvo", cb.validate_candidate(self.task_root, task, missing_bin)
+        )
+
+    def test_validate_oss_fuzz_rejects_bin_arvo(self):
+        task = cb.TaskRef(
+            "oss-fuzz:1", "m", "oss_fuzz_1", Path("data"), "d", "img", "oss-fuzz"
+        )
+        candidate = self._candidate(
+            replay="docker run -v /poc:/tmp/poc:ro img /bin/arvo"
+        )
+        self.assertIn(
+            "unexpected_bin_arvo_for_oss_fuzz",
+            cb.validate_candidate(self.task_root, task, candidate),
+        )
+
+    def test_validate_requires_observed_exit_for_confirmed(self):
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
+        )
+        candidate = self._candidate(observed_exit=None)
+        self.assertIn(
+            "missing_observed_exit",
+            cb.validate_candidate(self.task_root, task, candidate),
+        )
 
 
 if __name__ == "__main__":
