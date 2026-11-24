@@ -985,3 +985,40 @@
             "REVIEW_REPORT% lane=poc_bundle_review status=missing comments=0 critical=0"
         ));
     }
+
+    #[test]
+    fn s5_output_only_phase_rejects_command_use() {
+        let mut state = RunbookState::default();
+        state.start_turn("audit target", AuditMode::Lab);
+        state.record_subagent_lane(crate::runbook::RunbookLaneUpdate {
+            stage: "stage5",
+            lane_id: "poc_bundle_review",
+            status: "done",
+            claim_count: Some(0),
+            candidate_count: Some(0),
+            thread_id: Some("thread-review"),
+            summary: "review complete",
+        });
+        state.record_agent_message(
+            "REVIEW% action=drop target=VULN-009 reason=duplicate confidence=high\nREVIEW_REPORT% lane=poc_bundle_review status=done comments=1 critical=1 note=drop duplicate",
+        );
+        state.record_command(
+            "curl http://127.0.0.1:3000/rest/user/login",
+            Some("ok"),
+            "Completed",
+            Some(0),
+        );
+
+        let mut workflow = TriLaneWorkflow::new("audit target".to_string());
+        while workflow.phases[workflow.current].id != "s5_final_revision" {
+            workflow.current += 1;
+        }
+
+        let repair = match workflow.after_turn_completed(&state) {
+            WorkflowAction::Submit(prompt) => prompt,
+            other => panic!("expected output-only repair, got {other:?}"),
+        };
+        assert_eq!(repair.phase_id, "s5_final_revision");
+        assert!(repair.prompt.contains("output-only"));
+        assert!(repair.prompt.contains("Do not call tools"));
+    }

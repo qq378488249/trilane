@@ -122,6 +122,20 @@ impl TriLaneWorkflow {
             return WorkflowAction::Complete;
         };
 
+        // S5 的 review / final revision 是 output-only 阶段：即使 gate 指标满足，
+        // 只要这一阶段里跑过工具，就不接受产出，先要求重发纯文本。
+        let output_only = phase.id == "s5_final_revision";
+        if output_only && evidence_count(state, "command") > self.phase_start.commands {
+            if self.repairs_for_current < max_repairs_for_phase(phase, state) {
+                self.repairs_for_current += 1;
+                return self.submit_current(state, true);
+            }
+            return WorkflowAction::Blocked(format!(
+                "WORKFLOW% blocked phase={} reason=\"output-only phase executed tools\"",
+                phase.id
+            ));
+        }
+
         if phase_satisfied(phase, self.phase_start, state) {
             self.current += 1;
             self.repairs_for_current = 0;
@@ -310,6 +324,12 @@ fn max_repairs_for_phase(_phase: &WorkflowPhase, _state: &RunbookState) -> usize
 }
 
 fn phase_repair_instruction(phase: &WorkflowPhase, _state: &RunbookState) -> String {
+    if matches!(
+        phase.id,
+        "s5_adversarial_review" | "s5_final_revision"
+    ) {
+        return "\nWORKFLOW_REPAIR% This phase is output-only and the previous turn executed tools. Do not call tools, run commands, inspect source, or probe. Re-emit the required REVIEW%/POC% rows from the supplied context only.\n".to_string();
+    }
     if phase.gate == PhaseGate::S3Merge {
         return "\nWORKFLOW_REPAIR% S3 did not produce a clean output-only claim/debt handoff or it used commands. Do not call tools. Re-read only RUNBOOK_CONTEXT, then emit RUNBOOK% S3 Summary plus bare CLAIM%/MERGE%/CHAIN_CANDIDATE%/BREADTH% rows. Reuse input ids exactly, keep unresolved obligation rows as CLAIM% status=debt when still in scope, and do not emit DUPLICATE%, PROBE%, CONTROL%, VERIFY%, REJECTED%, FINDING%, markdown tables, or prose.\n".to_string();
     }
