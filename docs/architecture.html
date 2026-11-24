@@ -123,9 +123,9 @@
   .stage .code{font-size:11px;font-weight:800;letter-spacing:.6px;color:#fff;background:#2c5cd6;
     border-radius:6px;padding:2px 7px;align-self:flex-start}
   .stage .name{font-size:13.5px;font-weight:700}
-  .stage .desc{font-size:11.5px;color:#5b6478;line-height:1.55}
+  .stage .desc{font-size:11.5px;color:#5b6478;line-height:1.55;overflow-wrap:break-word}
   .stage .emit{font-size:10.5px;color:#7c4a03;background:#fff3d6;border:1px solid #f3d99b;
-    border-radius:6px;padding:4px 6px;line-height:1.5;word-break:break-word}
+    border-radius:6px;padding:4px 6px;line-height:1.5;overflow-wrap:break-word}
   .arrow{display:flex;align-items:center;color:#9aa3b5;font-size:18px;padding:0 1px}
 
   .lane-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
@@ -154,7 +154,7 @@
   table.tbl th{background:#f4f6fc;font-weight:700;color:#374151}
   table.tbl code{font-size:11.5px;background:#f3f4f6;border-radius:4px;padding:1px 5px;color:#b4232c}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  @media (max-width:980px){
+  @media screen and (max-width:980px){
     .two{grid-template-columns:1fr}
     .arch-grid{grid-template-columns:1fr}
     .axis{padding-top:4px}
@@ -163,10 +163,21 @@
   }
   footer{margin-top:46px;padding-top:16px;border-top:1px solid #e3e7ef;color:#8b93a7;font-size:11.5px;line-height:1.8}
   @media print{
+    @page{size:A3 portrait;margin:10mm}
+    *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
     body{background:#fff}
-    .wrap{max-width:none;padding:10mm}
+    .wrap{max-width:1280px;margin:0 auto;padding:0}
     .arch,.flow-card{box-shadow:none;break-inside:avoid}
-    h2.section{break-after:avoid}
+    h2.section{break-after:avoid;margin-top:26px}
+    header.hero{break-after:avoid}
+    .note{break-inside:avoid}
+    .ladder,.rung,table.tbl tr{break-inside:avoid}
+    .wrap > h2.section:nth-of-type(2){break-before:page}
+    .stage .emit{font-size:9.5px}
+    .stage .desc{font-size:11px}
+    .stage .name{font-size:12.5px}
+    .lane span{font-size:10.5px}
+    footer{break-before:avoid}
   }
 </style>
 </head>
@@ -229,7 +240,7 @@
           <div class="box small grow" style="background:#fff8e6;">Lane 调度器<br>并发 · 退避 · join</div>
           <div class="box small grow" style="background:#fff8e6;">Runbook 标记解析<br>CLAIM% / SURFACE% / POC%</div>
           <div class="box small grow" style="background:#fff8e6;">RunbookState<br>stages · claims · stats</div>
-          <div class="box small grow" style="background:#fff8e6;">续跑指令<br>TRILANE_RESUME_RUN%</div>
+          <div class="box small grow" style="background:#fff8e6;">续跑指令<br>TRILANE_<wbr>RESUME_<wbr>RUN%</div>
         </div>
       </div>
 
@@ -304,13 +315,13 @@
         <span class="code">S0</span>
         <div class="name">Admission 准入</div>
         <div class="desc">轻量索引源码树；确认/拉起目标服务；记录技术栈与规模。</div>
-        <div class="emit">RUNBOOK% S0<br>SERVICE_STATUS%<br>reachable/started/blocked</div>
+        <div class="emit">RUNBOOK% S0<br>SERVICE_STATUS%<br>reachable/<wbr>started/<wbr>blocked</div>
       </div>
       <div class="arrow">→</div>
       <div class="stage">
         <span class="code">S1</span>
         <div class="name">Recon 攻击面</div>
-        <div class="desc">两阶段：路由/API 边界 → source/sink/parser/egress。只做索引，不下结论。</div>
+        <div class="desc">两阶段：路由/API 边界 → source/sink/parser/<wbr>egress。只做索引，不下结论。</div>
         <div class="emit">SURFACE% ≤90<br>OBLIGATION%<br>READ_TARGET% ≤25<br>SCANNER_FACT%</div>
       </div>
       <div class="arrow">→</div>
@@ -325,14 +336,14 @@
         <span class="code">S3</span>
         <div class="name">FoA 合并</div>
         <div class="desc">纯输出步骤：规范化 claim、合并重复、生成验证计划与链候选。</div>
-        <div class="emit">MERGE%<br>CHAIN_CANDIDATE%<br>BREADTH%<br>CLAIM%(复用 id)</div>
+        <div class="emit">MERGE%<br>CHAIN_<wbr>CANDIDATE%<br>BREADTH%<br>CLAIM%(复用 id)</div>
       </div>
       <div class="arrow">→</div>
       <div class="stage">
         <span class="code">S4</span>
         <div class="name">Fuzz 实弹验证</div>
         <div class="desc">四个子阶段：认证/会话 → 注入/XSS → 文件/SSRF/业务 → 回归扫描。每条 claim 必须显式收口。</div>
-        <div class="emit">PROBE% + CONTROL%<br>→ VERIFY% / REJECTED%<br>/ S4_SKIP%<br>replay=&lt;curl&gt;</div>
+        <div class="emit">PROBE% + CONTROL%<br>→ VERIFY% / REJECTED%<br>/ S4_<wbr>SKIP%<br>replay=&lt;curl&gt;</div>
       </div>
       <div class="arrow">→</div>
       <div class="stage">
@@ -413,7 +424,7 @@
       <div class="stage" style="flex:1.15">
         <span class="code">STEP 3</span>
         <div class="name">语义族聚合</div>
-        <div class="desc">把 title/category/target/code_path/root_cause/positive_evidence/payload 拼成语义面，抽取 title 与 location 组成家族 key，分组。</div>
+        <div class="desc">把 title/category/target/code_path/<wbr>root_cause/<wbr>positive_evidence/<wbr>payload 拼成语义面，抽取 title 与 location 组成家族 key，分组。</div>
         <div class="emit">semantic_family_key()<br>BTreeMap&lt;key, Vec&lt;finding&gt;&gt;</div>
       </div>
       <div class="arrow">→</div>
@@ -435,15 +446,15 @@
 
   <div class="flow-card">
     <div class="stages">
-      <div class="stage"><span class="code">1</span><div class="name">准备任务包</div><div class="desc">装配 TASK.md、poc 目录、state 目录；复用上轮 stage 状态。</div><div class="emit">prepare_task_package()</div></div>
+      <div class="stage"><span class="code">1</span><div class="name">准备任务包</div><div class="desc">装配 TASK.md、poc 目录、state 目录；复用上轮 stage 状态。</div><div class="emit">prepare_<wbr>task_<wbr>package()</div></div>
       <div class="arrow">→</div>
       <div class="stage"><span class="code">2</span><div class="name">磁盘门禁</div><div class="desc">加锁检查运行盘 + 镜像盘；按「本任务 + 其他在跑任务」预留。不足则整批 abort，不重试。</div><div class="emit">RUN_SPACE_GB<br>disk_space</div></div>
       <div class="arrow">→</div>
-      <div class="stage"><span class="code">3</span><div class="name">起 DinD</div><div class="desc">每任务私有 dind；同路径挂载 task/out/state；离线导入目标镜像与智能体镜像。</div><div class="emit">--isolation dind<br>load_image_into_dind()</div></div>
+      <div class="stage"><span class="code">3</span><div class="name">起 DinD</div><div class="desc">每任务私有 dind；同路径挂载 task/out/state；离线导入目标镜像与智能体镜像。</div><div class="emit">--isolation dind<br>load_<wbr>image_<wbr>into_<wbr>dind()</div></div>
       <div class="arrow">→</div>
-      <div class="stage"><span class="code">4</span><div class="name">Headless 审计</div><div class="desc">智能体在 dind 内跑自身容器；S0→S5 完成后写 result.json。</div><div class="emit">timeout+600s 硬杀<br>resume=off/timeout/always</div></div>
+      <div class="stage"><span class="code">4</span><div class="name">Headless 审计</div><div class="desc">智能体在 dind 内跑自身容器；S0→S5 完成后写 result.json。</div><div class="emit">timeout+600s 硬杀<br>resume=off/<wbr>timeout/<wbr>always</div></div>
       <div class="arrow">→</div>
-      <div class="stage"><span class="code">5</span><div class="name">收集 PoC</div><div class="desc">优先级：manifest &gt; findings.evidence_refs &gt; 目录扫描；对照组输入沉底。</div><div class="emit">PocCandidate.sort_key()<br>--max-submits</div></div>
+      <div class="stage"><span class="code">5</span><div class="name">收集 PoC</div><div class="desc">优先级：manifest &gt; findings.evidence_refs &gt; 目录扫描；对照组输入沉底。</div><div class="emit">PocCandidate.<wbr>sort_key()<br>--max-submits</div></div>
       <div class="arrow">→</div>
       <div class="stage"><span class="code">6</span><div class="name">提交 + 判定</div><div class="desc">vul 跑与 fix 跑；按退出码判定，多轮取多数票，平票 unstable。</div><div class="emit">judge(): solved / vul_only<br>no_crash / fix_also_crashes<br>consensus()</div></div>
     </div>
