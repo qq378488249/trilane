@@ -17,8 +17,8 @@
 
 FROM docker.1ms.run/library/python:3.12-slim
 
-# apt 走国内镜像；服务器能直连 Debian 官方源时把这两行换成默认源即可
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+# apt 走国内镜像；华为云 HTTP 在容器内不需要 CA 证书，Debian 官方源慢时可直接用
+RUN sed -i 's|deb.debian.org|mirrors.huaweicloud.com|g; s|security.debian.org|mirrors.huaweicloud.com|g' \
       /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
 RUN apt-get update \
@@ -26,7 +26,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # 只装跑批脚本需要的依赖，不引入任何智能体运行时的东西
-RUN pip install --no-cache-dir requests
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" requests
 
 # docker CLI：脚本靠它 docker run / docker images / docker pull。
 # 只装客户端，daemon 是宿主的（通过 /var/run/docker.sock 接入）。

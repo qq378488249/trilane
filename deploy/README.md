@@ -36,9 +36,12 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.18，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
-| `trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
+| `trilane-batch-runner.tgz` | 61MB | 编排器 1.0.19，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
+
+`trilane-headless:1.0.8` 的 Rust 二进制在 WSL（Ubuntu 24.04）里编译后 COPY 进 runtime-only 镜像，
+基础运行层也是 Ubuntu 24.04；镜像构建不再包含 cargo/前端编译，详见 `docker/WSL_BUILD_PLAN.md`。
 
 暂**不含**目标镜像（`n132/arvo:<id>-vul`，每个 0.5–2GB）和数据集，按 §2 单独打包搬运。
 
@@ -75,9 +78,9 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.18），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.18.tgz` | 71MB | 同上，带版本号的副本 |
-| `images/trilane-headless-1.0.7.tar.gz` | 320MB | 智能体本体 |
+| `images/trilane-batch-runner.tgz` | 61MB | 编排器（1.0.19），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.19.tgz` | 61MB | 同上，带版本号的副本 |
+| `images/trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
@@ -127,7 +130,7 @@ cp /opt/cybergym/mask_map.json /opt/
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.18 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.19 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -233,7 +236,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.18 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.19 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -242,13 +245,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.18 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.18 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.19 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.18 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.19 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -267,15 +270,13 @@ docker build \
   --build-arg HTTPS_PROXY=http://host.docker.internal:7897 \
   --build-arg ALL_PROXY=http://host.docker.internal:7897 \
   --build-arg NO_PROXY=mirrors.aliyun.com,security.debian.org,localhost,127.0.0.1 \
-  -f docker/headless.Dockerfile -t trilane-headless:latest .
+  -f docker/linux-headless.Dockerfile -t trilane-headless:latest .
 ```
 
 几个前提（踩过的坑）：
 
-- **必须带代理参数**：cargo 要拉 `chromium.googlesource.com`（libyuv 子模块）等依赖，
-  国内直连会被拒。代理地址按自己的改。
-- **前端 `dist/` 要先在宿主构建好**：镜像里不装 Node，直接 `COPY` 这份产物。
-- `docker/rusty_v8/` 里要预置 rusty_v8 静态库，构建时才不会去 GitHub 拉。
+- **镜像不再跑 cargo/Node**：二进制在 WSL 宿主编译后 `COPY` 进来，前端 `dist/` 只在编译前于宿主构建并打进二进制；`docker/rusty_v8/` 无需预置，V8 静态库由 cargo 下载到 `target/release/gn_out/obj/librusty_v8.a`，详见 `docker/WSL_BUILD_PLAN.md`。
+- 上面的代理参数对 runtime-only 镜像已非必需；只有宿主重新编译 Rust 二进制时才需要联网。
 - 走 Docker Desktop 时，Linux 容器里的 `host.docker.internal` 指宿主；
   在 Linux 服务器上构建则改成实际的代理地址。
 
@@ -381,7 +382,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.18 \
+  trilane-batch-runner:1.0.19 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -399,7 +400,7 @@ docker run -d --name trilane-batch-1 \
   # 镜像盘检查：宿主机 docker 数据目录（同路径只读挂载）；不配则退回 dind 内 df
   -v /var/lib/docker:/var/lib/docker:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.18 \
+  trilane-batch-runner:1.0.19 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -583,7 +584,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.18 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.19 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
