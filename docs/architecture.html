@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TriLane 架构与算法图</title>
+<style>
+  :root{
+    --ink:#1f2937;
+    --muted:#6b7280;
+    --blue:#2c5cd6;
+    --pink:#f6d3d8;
+    --sky:#d9eef8;
+    --yellow:#f6c847;
+    --lav:#dedcf7;
+    --lav-deep:#b9b6ef;
+    --green:#cfe6d4;
+    --green-deep:#a8cfa9;
+    --peach:#f8dfc2;
+    --line:#c9ccd4;
+    --card:#ffffff;
+    --shadow:0 1px 2px rgba(17,24,39,.08),0 6px 18px rgba(17,24,39,.06);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:#f3f5f9;
+    color:var(--ink);
+    font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1280px;margin:0 auto;padding:40px 28px 72px}
+  header.hero{
+    display:flex;align-items:flex-end;justify-content:space-between;gap:24px;
+    padding-bottom:22px;border-bottom:2px solid #e3e7ef;margin-bottom:30px;
+  }
+  .hero h1{font-size:30px;line-height:1.2;margin:0 0 8px;letter-spacing:.2px}
+  .hero p{margin:0;color:var(--muted);font-size:14px;line-height:1.7;max-width:760px}
+  .hero .meta{font-size:12px;color:#8b93a7;text-align:right;line-height:1.8;white-space:nowrap}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;background:#e8ecff;color:#2c5cd6;font-size:12px;margin-right:6px}
+
+  h2.section{
+    font-size:19px;margin:44px 0 8px;display:flex;align-items:center;gap:10px;
+  }
+  h2.section .num{
+    width:26px;height:26px;border-radius:8px;background:#2c5cd6;color:#fff;
+    display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;
+  }
+  p.lead{margin:0 0 18px;color:var(--muted);font-size:13.5px;line-height:1.7}
+
+  /* ---------- layered architecture ---------- */
+  .arch{
+    background:var(--card);border:1px solid #e3e7ef;border-radius:16px;padding:18px 18px 14px;
+    box-shadow:var(--shadow);
+  }
+  .arch-grid{display:grid;grid-template-columns:132px minmax(0,1fr) 88px;gap:10px 14px;align-items:stretch}
+  .axis{
+    grid-column:1;
+    display:flex;align-items:center;justify-content:flex-start;
+    font-size:15.5px;font-weight:700;color:var(--blue);letter-spacing:.5px;
+    padding-left:4px;
+  }
+  .band{
+    grid-column:2;
+    border-radius:10px;padding:14px 16px;position:relative;
+    display:flex;gap:12px;align-items:stretch;flex-wrap:wrap;
+  }
+  .band.pink{background:var(--pink);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  .band.sky{background:var(--sky);display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .band.yellow{background:var(--yellow);justify-content:center}
+  .band.lav{background:var(--lav)}
+  .band.green{background:var(--green);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  .band.peach{background:var(--peach);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  .col-label{
+    align-self:flex-start;font-size:13.5px;font-weight:700;color:#2f3b52;
+    padding:4px 2px;white-space:nowrap;
+  }
+  .box{
+    background:var(--card);border:1px solid #d7dbe4;border-radius:8px;padding:9px 14px;
+    font-size:13px;line-height:1.35;color:#28303f;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;min-height:42px;box-shadow:0 1px 1px rgba(17,24,39,.03);
+  }
+  .box small{display:block;font-size:10.5px;color:#6b7280;font-weight:400;line-height:1.45;margin-top:3px}
+  .box.small{font-size:12px;padding:8px 10px;min-height:36px}
+  .box.blue{background:#d8e2f8;border-color:#b9c8ee;font-weight:600}
+  .box.white{background:#fff}
+  .box.ghost{background:rgba(255,255,255,.55);border-style:dashed}
+  .box.grow{flex:1}
+  .cluster{
+    flex:1;background:rgba(255,255,255,.55);border:1px solid #cfcdf0;border-radius:9px;
+    padding:10px 12px 12px;display:flex;flex-direction:column;gap:9px;min-width:0;
+  }
+  .cluster h4{margin:0;font-size:13.5px;font-weight:700;color:#2f2f55;text-align:center}
+  .cluster .row{display:flex;gap:9px;flex-wrap:wrap}
+  .cluster .row .box{flex:1;min-width:88px}
+  .band.lav .cluster:nth-of-type(2) .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+  .band.lav .cluster:nth-of-type(2) .row .box{min-width:0;padding:7px 6px}
+  .band.lav .cluster:nth-of-type(3) .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+  .band.lav .cluster:nth-of-type(3) .row .box{min-width:0;padding:7px 6px}
+  .side-col{
+    width:66px;border-radius:8px;background:#e9e8fb;border:1px dashed #b9b6ef;
+    display:flex;align-items:center;justify-content:center;text-align:center;
+    font-size:12.5px;font-weight:700;color:#3d3a78;padding:8px 4px;line-height:1.5;
+  }
+  .ops{
+    grid-column:3;grid-row:4 / span 3;background:var(--green-deep);border-radius:10px;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+    color:#1f3d22;font-weight:700;font-size:14px;padding:14px 10px;text-align:center;
+    border:1px dashed #7ea87f;
+  }
+  .ops .tag{font-weight:500;font-size:11.5px;color:#33563a;line-height:1.55}
+
+  /* ---------- flow ---------- */
+  .flow-card{
+    background:var(--card);border:1px solid #e3e7ef;border-radius:16px;
+    padding:22px;box-shadow:var(--shadow);
+  }
+  .stages{display:flex;gap:8px;align-items:stretch;flex-wrap:nowrap}
+  .stage{
+    flex:1;min-width:0;border:1px solid #d9dee9;border-radius:10px;background:#fbfcff;
+    padding:10px 10px 12px;display:flex;flex-direction:column;gap:6px;
+  }
+  .stage .code{font-size:11px;font-weight:800;letter-spacing:.6px;color:#fff;background:#2c5cd6;
+    border-radius:6px;padding:2px 7px;align-self:flex-start}
+  .stage .name{font-size:13.5px;font-weight:700}
+  .stage .desc{font-size:11.5px;color:#5b6478;line-height:1.55}
+  .stage .emit{font-size:10.5px;color:#7c4a03;background:#fff3d6;border:1px solid #f3d99b;
+    border-radius:6px;padding:4px 6px;line-height:1.5;word-break:break-word}
+  .arrow{display:flex;align-items:center;color:#9aa3b5;font-size:18px;padding:0 1px}
+
+  .lane-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  .lane{flex:1;min-width:150px;border-radius:10px;padding:10px 12px;background:#eef1ff;border:1px solid #d3d9f7}
+  .lane b{display:block;font-size:12.5px;margin-bottom:4px;color:#2c3a7a}
+  .lane span{font-size:11px;color:#5b6478;line-height:1.5}
+
+  .note{
+    margin-top:14px;font-size:12px;color:#5b6478;line-height:1.7;
+    background:#f7f9ff;border:1px dashed #cfd8ef;border-radius:9px;padding:10px 13px;
+  }
+  .note b{color:#2c5cd6}
+
+  /* ---------- ladder ---------- */
+  .ladder{display:flex;flex-direction:column;gap:8px}
+  .rung{display:grid;grid-template-columns:180px 44px 1fr;align-items:center;gap:12px}
+  .rung .lv{background:#eef1ff;border:1px solid #d3d9f7;border-radius:8px;padding:8px 12px;
+    font-size:12.5px;font-weight:700;color:#2c3a7a;text-align:center}
+  .rung .eq{text-align:center;color:#9aa3b5;font-size:15px}
+  .rung .st{background:#fff;border:1px solid #e0e4ee;border-radius:8px;padding:8px 12px;font-size:12.5px}
+  .rung .st b{color:#1f4d2b}
+  .rung .st i{font-style:normal;color:#8b5a00}
+
+  table.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  table.tbl th,table.tbl td{border:1px solid #e3e7ef;padding:8px 10px;text-align:left;vertical-align:top}
+  table.tbl th{background:#f4f6fc;font-weight:700;color:#374151}
+  table.tbl code{font-size:11.5px;background:#f3f4f6;border-radius:4px;padding:1px 5px;color:#b4232c}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:980px){
+    .two{grid-template-columns:1fr}
+    .arch-grid{grid-template-columns:1fr}
+    .axis{padding-top:4px}
+    .stages{flex-wrap:wrap}
+    .stage{min-width:180px}
+  }
+  footer{margin-top:46px;padding-top:16px;border-top:1px solid #e3e7ef;color:#8b93a7;font-size:11.5px;line-height:1.8}
+  @media print{
+    body{background:#fff}
+    .wrap{max-width:none;padding:10mm}
+    .arch,.flow-card{box-shadow:none;break-inside:avoid}
+    h2.section{break-after:avoid}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <div>
+      <h1>TriLane 架构与算法图</h1>
+      <p>一次自然语言目标 → 显式攻击面 → 六路语义审计 → 合并/证伪 → 实弹探针 → 证据化 PoC。下图按「前端 / 接入 / 编排 / 服务中台 / 公共基础 / 存储 + 运维」分层，并给出主流水线、证据阶梯、去重指纹与跑批判定四组核心算法。</p>
+    </div>
+    <div class="meta">
+      <span class="pill">Tauri 2</span><span class="pill">Rust</span><span class="pill">React + Vite</span><br>
+      Rust workspace · 97 crates<br>
+      源码基线：trilane-rs / deploy
+    </div>
+  </header>
+
+  <!-- ================= 1. 分层架构 ================= -->
+  <h2 class="section"><span class="num">1</span>分层架构</h2>
+  <p class="lead">左侧为逻辑分层，右侧为对应实现模块；最右侧竖栏是贯穿所有层的运维与隔离能力。</p>
+
+  <div class="arch">
+    <div class="arch-grid">
+
+      <!-- 前端 -->
+      <div class="axis">前端应用</div>
+      <div class="band pink">
+        <div class="box grow">Tauri 桌面 GUI<br><small>ScanPanel · StageProgress</small></div>
+        <div class="box grow">攻击面图谱<br><small>AsmGraph · @xyflow/dagre</small></div>
+        <div class="box grow">Findings 证据面板<br><small>去重后的 VULN 列表</small></div>
+        <div class="box grow">Chat 对话<br><small>ChatPanel · 实时事件</small></div>
+        <div class="box grow">Settings<br><small>模型 / Safe·Lab / 路径</small></div>
+        <div class="box grow">Headless CLI<br><small>--headless --objective-file</small></div>
+      </div>
+      <div class="ops" style="grid-row:4 / span 3;grid-column:3;">
+        <div>运 维</div>
+        <div class="tag">Docker DinD<br>每任务私有 dockerd</div>
+        <div class="tag">compose 跑批<br>CyberGym 提交</div>
+        <div class="tag">磁盘门禁<br>同路径挂载 · 预留</div>
+        <div class="tag">Stage 级续跑<br>多轮投票判定</div>
+      </div>
+
+      <!-- 接入 -->
+      <div class="axis">服务接入</div>
+      <div class="band sky" style="grid-column:2;">
+        <div class="box">Tauri IPC<br><small>commands + events</small></div>
+        <div class="box">In-process App Server<br><small>JSON-RPC · Thread/Turn</small></div>
+        <div class="box">axum HTTP 适配<br><small>/v1/responses → Chat</small></div>
+        <div class="box">CLI / arg0<br><small>npx trilane app</small></div>
+      </div>
+
+      <!-- API / 编排 -->
+      <div class="axis">API / 编排</div>
+      <div class="band yellow" style="grid-column:2;flex-direction:column;align-items:stretch;">
+        <div class="box" style="background:#fff;border-color:#e0b93a;font-weight:700;">
+          TriLaneWorkflow 状态机 &nbsp;·&nbsp; PhaseGate 门控 &nbsp;·&nbsp; 修复/进度重试
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <div class="box small grow" style="background:#fff8e6;">Lane 调度器<br>并发 · 退避 · join</div>
+          <div class="box small grow" style="background:#fff8e6;">Runbook 标记解析<br>CLAIM% / SURFACE% / POC%</div>
+          <div class="box small grow" style="background:#fff8e6;">RunbookState<br>stages · claims · stats</div>
+          <div class="box small grow" style="background:#fff8e6;">续跑指令<br>TRILANE_RESUME_RUN%</div>
+        </div>
+      </div>
+
+      <!-- 服务中台 -->
+      <div class="axis">服务中台</div>
+      <div class="band lav" style="grid-column:2;">
+        <div class="cluster">
+          <h4>Agent Core</h4>
+          <div class="row">
+            <div class="box small">会话 / Turn</div>
+            <div class="box small">工具调用</div>
+            <div class="box small">上下文压缩</div>
+            <div class="box small">MCP 客户端</div>
+          </div>
+        </div>
+        <div class="cluster">
+          <h4>六路语义审计 Lane</h4>
+          <div class="row">
+            <div class="box small">identity</div>
+            <div class="box small">injection</div>
+            <div class="box small">ingress</div>
+            <div class="box small">logic</div>
+            <div class="box small">config</div>
+            <div class="box small ghost">quick_hits</div>
+          </div>
+        </div>
+        <div class="cluster">
+          <h4>确定性分析</h4>
+          <div class="row">
+            <div class="box small">Source Scanner<br><small>rg-first · 防符号环</small></div>
+            <div class="box small">Attack Graph<br><small>atoms · bridge · chain</small></div>
+            <div class="box small">Claims<br><small>证据阶梯</small></div>
+            <div class="box small">Dedupe<br><small>语义族指纹</small></div>
+          </div>
+        </div>
+        <div class="side-col">日志记录</div>
+        <div class="side-col">权限控制<br><small>Safe / Lab</small></div>
+      </div>
+
+      <!-- 公共基础 -->
+      <div class="axis">公共基础服务</div>
+      <div class="band green" style="grid-column:2;">
+        <div class="box">模型 Provider 配置<br><small>OpenAI 兼容 · auth</small></div>
+        <div class="box">统一重试<br><small>指数退避 + 抖动 + 封顶</small></div>
+        <div class="box">网络代理 / 出网策略<br><small>egress policy</small></div>
+        <div class="box">沙箱<br><small>Landlock · Seatbelt · Win</small></div>
+        <div class="box">execpolicy<br><small>命令准入</small></div>
+        <div class="box">OTEL / Analytics<br><small>rollout trace</small></div>
+      </div>
+
+      <!-- 存储 -->
+      <div class="axis">数据存储层</div>
+      <div class="band peach" style="grid-column:2;">
+        <div class="box">runbook.json<br><small>每 stage 全量状态</small></div>
+        <div class="box">status.json<br><small>轻量进度</small></div>
+        <div class="box">transcript.md<br><small>逐 stage 转录</small></div>
+        <div class="box">result.json / report.md<br><small>headless 产出</small></div>
+        <div class="box">agent-graph-store<br><small>攻击面图持久化</small></div>
+        <div class="box">runs/&lt;batch&gt;/&lt;task&gt;<br><small>task · out · state · log</small></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ================= 2. 主流水线 ================= -->
+  <h2 class="section"><span class="num">2</span>主流水线算法：S0 → S5</h2>
+  <p class="lead">每个阶段都是一个「合约 + 门控」：模型必须输出机器可读的标记行，后端据此判定是否放行；不放行则先做进度修复、再做合约修复。</p>
+
+  <div class="flow-card">
+    <div class="stages">
+      <div class="stage">
+        <span class="code">S0</span>
+        <div class="name">Admission 准入</div>
+        <div class="desc">轻量索引源码树；确认/拉起目标服务；记录技术栈与规模。</div>
+        <div class="emit">RUNBOOK% S0<br>SERVICE_STATUS%<br>reachable/started/blocked</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <span class="code">S1</span>
+        <div class="name">Recon 攻击面</div>
+        <div class="desc">两阶段：路由/API 边界 → source/sink/parser/egress。只做索引，不下结论。</div>
+        <div class="emit">SURFACE% ≤90<br>OBLIGATION%<br>READ_TARGET% ≤25<br>SCANNER_FACT%</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <span class="code">S2</span>
+        <div class="name">Audit 六路并行</div>
+        <div class="desc">后端调度 5 条核心 lane，join 后再跑 quick_hits 残差召回。</div>
+        <div class="emit">CLAIM%<br>status=seed/debt<br>next=poc:&lt;unit&gt;</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <span class="code">S3</span>
+        <div class="name">FoA 合并</div>
+        <div class="desc">纯输出步骤：规范化 claim、合并重复、生成验证计划与链候选。</div>
+        <div class="emit">MERGE%<br>CHAIN_CANDIDATE%<br>BREADTH%<br>CLAIM%(复用 id)</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <span class="code">S4</span>
+        <div class="name">Fuzz 实弹验证</div>
+        <div class="desc">四个子阶段：认证/会话 → 注入/XSS → 文件/SSRF/业务 → 回归扫描。每条 claim 必须显式收口。</div>
+        <div class="emit">PROBE% + CONTROL%<br>→ VERIFY% / REJECTED%<br>/ S4_SKIP%<br>replay=&lt;curl&gt;</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <span class="code">S5</span>
+        <div class="name">Verify 裁决</div>
+        <div class="desc">去重后为每个存活家族产出唯一 POC；再由独立 review lane 复议，最后修订。</div>
+        <div class="emit">POC%<br>verification=<br>verified / generated-not-verified / needs-poc</div>
+      </div>
+    </div>
+
+    <div class="lane-row">
+      <div class="lane"><b>identity_engine</b><span>登录/注册/改密、2FA、JWT/session、角色分配、对象归属、IDOR/BOLA、管理端门禁</span></div>
+      <div class="lane"><b>injection_engine</b><span>SQL/NoSQL/模板/命令注入、eval/vm、反射/存储/DOM XSS、sanitizer 边界、CORS/头</span></div>
+      <div class="lane"><b>ingress_engine</b><span>上传/MIME/解析器、路径穿越/LFI、XXE、SSRF、开放重定向</span></div>
+      <div class="lane"><b>logic_engine</b><span>金额/订单/优惠券/配额、状态机与业务不变量、支付/权益/导出流程</span></div>
+      <div class="lane"><b>config_engine</b><span>密钥/配置/文档/指标暴露、弱加密与口令存储、依赖与调试面</span></div>
+      <div class="lane" style="background:#f6f6fb;border-style:dashed"><b>quick_hits_engine</b><span>核心 lane join 后的 rg-first 残差召回；空跑或失败不阻塞 S3</span></div>
+    </div>
+
+    <div class="note">
+      <b>门控与降级：</b>S2 / S3 / S4 / S5 是 hard gate；失败先做 1 次合约修复、最多 2 次进度修复。S4 仍无实弹证据时不阻塞全局，而是 <b>DeferPhase</b> 把 claim 保留为 needs-poc / source-backed，交给 S5 以「generated-not-verified」发布。<br>
+      <b>证据纪律：</b>S1 只排班不下结论；S2 只出候选；S3 不调用工具；S4 每条 handoff claim 必须落到 VERIFY / REJECTED / S4_SKIP 三者之一；S5 不重新发现漏洞，只打包可复放 PoC。
+    </div>
+  </div>
+
+  <!-- ================= 3. 证据阶梯 ================= -->
+  <h2 class="section"><span class="num">3</span>证据阶梯与声明状态机</h2>
+  <p class="lead">证据等级只升不降；状态合并时，丢弃/合并/阻断是终态，其余按 rank 取高。</p>
+
+  <div class="flow-card">
+    <div class="two">
+      <div class="ladder">
+        <div class="rung"><div class="lv">signal</div><div class="eq">→</div><div class="st"><b>seed</b> · 仅弱信号/线索</div></div>
+        <div class="rung"><div class="lv">source-backed</div><div class="eq">→</div><div class="st"><b>anchored</b> · 有代码路径/根因锚点</div></div>
+        <div class="rung"><div class="lv">runtime-signal</div><div class="eq">→</div><div class="st"><b>corroborated</b> · 有运行时响应信号</div></div>
+        <div class="rung"><div class="lv">reproducible</div><div class="eq">→</div><div class="st"><b>verified</b> · 有可复放 payload/步骤</div></div>
+        <div class="rung"><div class="lv">impact-proven</div><div class="eq">→</div><div class="st"><b>weaponized</b> · 证明实际影响</div></div>
+        <div class="rung"><div class="lv">control-passed</div><div class="eq">→</div><div class="st"><b>publishable</b> · 阳性 + 同条件阴性对照</div></div>
+      </div>
+      <div>
+        <table class="tbl">
+          <tr><th>推断维度</th><th>判定关键词（命中即升级）</th></tr>
+          <tr><td>source</td><td>code_path 非空，或出现 <code>root_cause</code> / <code>source</code></td></tr>
+          <tr><td>runtime</td><td><code>status 200</code>、<code>http </code>、<code>curl </code>、<code>returned</code>、<code>response</code></td></tr>
+          <tr><td>repro</td><td>payload 非空，或出现 <code>poc</code> / <code>repro</code></td></tr>
+          <tr><td>impact</td><td><code>admin</code>、<code>exfil</code>、<code>takeover</code>、<code>bypass</code>、<code>unauthorized</code></td></tr>
+          <tr><td>control</td><td><code>negative</code>、<code>control</code>、<code>baseline</code>、<code>isolation</code></td></tr>
+        </table>
+        <div class="note" style="margin-top:12px">
+          <b>合并规则：</b><code>EvidenceLevel::merge</code> 取较高等级；<code>ClaimStatus::merge</code> 中
+          <code>discarded / merged / blocked</code> 直接覆盖，其余按 rank 取高。<br>
+          <b>发布资格：</b>只有 <code>control-passed</code> 且带阴性对照才映射为 <code>publishable</code>；否则最高只到 <code>weaponized</code>。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 4. 去重 ================= -->
+  <h2 class="section"><span class="num">4</span>去重与家族指纹算法</h2>
+  <p class="lead">目标不是文本相似，而是「同一根因 + 同一路由/sink + 同一利用原语」；不同 PoC 单元即使共享根因也保持分离。</p>
+
+  <div class="flow-card">
+    <div class="stages" style="align-items:stretch">
+      <div class="stage" style="flex:1.1">
+        <span class="code">STEP 1</span>
+        <div class="name">归一化 PoC 单元</div>
+        <div class="desc">从 <code>precondition</code>/<code>next</code> 中取 <code>poc:</code> 之后的值；否则由 category + target + title 派生，截断 96 字符。</div>
+        <div class="emit">lower → 非字母数字折叠为 '-'<br>JWT none ≠ JWT HS256</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage" style="flex:1.15">
+        <span class="code">STEP 2</span>
+        <div class="name">claim 指纹</div>
+        <div class="desc">有 PoC 单元时：<code>category:poc:unit</code>；否则 <code>category:location:cause</code>（location 去掉 localhost:3000，斜杠/冒号转下划线）。</div>
+        <div class="emit">canonical_claim_fingerprint()</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage" style="flex:1.15">
+        <span class="code">STEP 3</span>
+        <div class="name">语义族聚合</div>
+        <div class="desc">把 title/category/target/code_path/root_cause/positive_evidence/payload 拼成语义面，抽取 title 与 location 组成家族 key，分组。</div>
+        <div class="emit">semantic_family_key()<br>BTreeMap&lt;key, Vec&lt;finding&gt;&gt;</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage" style="flex:1.1">
+        <span class="code">STEP 4</span>
+        <div class="name">选主 + 排序</div>
+        <div class="desc">组内按 severity → verification → duplicates → title 排序；保留主条目，其余记入 duplicates；全量再按同一 rank 排序并编号。</div>
+        <div class="emit">VULN-001, VULN-002 …<br>dedupe_summary{raw, final, verified}</div>
+      </div>
+    </div>
+    <div class="note">
+      <b>约束：</b>组内主条目必须携带可复放信息；重复项只记 id。severity 取高、verification 取强，避免「同一漏洞被低质量副本覆盖」。<b>输出：</b><code>final_findings</code> 是报告与 PoC 打包的唯一来源。
+    </div>
+  </div>
+
+  <!-- ================= 5. 跑批 ================= -->
+  <h2 class="section"><span class="num">5</span>跑批判定算法（deploy / CyberGym）</h2>
+  <p class="lead">单任务 = 一次隔离容器运行 + PoC 收集 + 提交 + 阴阳两跑 + 多轮投票；超时按 stage 续跑，磁盘不足直接落账不重试。</p>
+
+  <div class="flow-card">
+    <div class="stages">
+      <div class="stage"><span class="code">1</span><div class="name">准备任务包</div><div class="desc">装配 TASK.md、poc 目录、state 目录；复用上轮 stage 状态。</div><div class="emit">prepare_task_package()</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><span class="code">2</span><div class="name">磁盘门禁</div><div class="desc">加锁检查运行盘 + 镜像盘；按「本任务 + 其他在跑任务」预留。不足则整批 abort，不重试。</div><div class="emit">RUN_SPACE_GB<br>disk_space</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><span class="code">3</span><div class="name">起 DinD</div><div class="desc">每任务私有 dind；同路径挂载 task/out/state；离线导入目标镜像与智能体镜像。</div><div class="emit">--isolation dind<br>load_image_into_dind()</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><span class="code">4</span><div class="name">Headless 审计</div><div class="desc">智能体在 dind 内跑自身容器；S0→S5 完成后写 result.json。</div><div class="emit">timeout+600s 硬杀<br>resume=off/timeout/always</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><span class="code">5</span><div class="name">收集 PoC</div><div class="desc">优先级：manifest &gt; findings.evidence_refs &gt; 目录扫描；对照组输入沉底。</div><div class="emit">PocCandidate.sort_key()<br>--max-submits</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><span class="code">6</span><div class="name">提交 + 判定</div><div class="desc">vul 跑与 fix 跑；按退出码判定，多轮取多数票，平票 unstable。</div><div class="emit">judge(): solved / vul_only<br>no_crash / fix_also_crashes<br>consensus()</div></div>
+    </div>
+
+    <div class="note">
+      <b>判定表：</b>
+      <code>vul 不崩 → no_crash</code>；
+      <code>vul 崩 &amp; fix 未跑 → vul_only</code>；
+      <code>vul 崩 &amp; fix 退出 0 → solved</code>；
+      <code>vul 崩 &amp; fix 也崩 → fix_also_crashes</code>。
+      原因是 MSan 类未初始化读依赖堆布局，单次结果不可信，故 <b>--verify-rounds</b> 多轮取多数票，平票按「没解出」保守处理。<br>
+      <b>续跑：</b>超时后读 <code>stage(N-1)/runbook.json</code>，删除 stageN 及之后目录，复用同一 run_id 从 stageN 重跑；粒度是整个 stage。
+    </div>
+  </div>
+
+  <!-- ================= 6. 横切 ================= -->
+  <h2 class="section"><span class="num">6</span>横切机制</h2>
+  <div class="two">
+    <div class="flow-card" style="padding:18px">
+      <h3 style="margin:0 0 8px;font-size:15px">统一 LLM 重试</h3>
+      <p class="lead" style="margin-bottom:10px">四层重试统一为「默认重试、显式排除」：除用户取消、配置/环境错误、上下文超长、需先修历史的请求外，全部重试。</p>
+      <div class="box white" style="justify-content:flex-start;font-family:ui-monospace,Consolas,monospace;font-size:12px">
+        delay = min(base × 2<sup>attempt-1</sup> × rand(0.9, 1.1), max_delay)
+      </div>
+      <div class="note" style="margin-top:10px">HTTP 层默认 8 次、流/turn 层默认 10 次、GUI lane 层默认 8 次（<code>TRILANE_LANE_MAX_ATTEMPTS</code> 可配）；两层预算相乘，最坏约百次请求但退避封顶。</div>
+    </div>
+    <div class="flow-card" style="padding:18px">
+      <h3 style="margin:0 0 8px;font-size:15px">安全与隔离边界</h3>
+      <p class="lead" style="margin-bottom:10px">Safe 模式默认；Lab 模式才放开本地文件系统与命令执行。沙箱按平台落地：Linux Landlock/seccomp，macOS Seatbelt，Windows sandbox；出网经网络代理与策略判定。</p>
+      <div class="note">批处理再套一层：每任务独立 dind，智能体容器只能看到私有 dockerd；宿主 daemon 对智能体不可见；进度、日志、状态目录同路径挂载以兼容 dind 路径解析。</div>
+    </div>
+  </div>
+
+  <footer>
+    依据当前仓库代码整理：<code>trilane-rs/trilane-gui/src/workflow_*.inc.rs</code>、<code>runbook_*.rs/.inc.rs</code>、<code>source_scanner.rs</code>、<code>main_workflow_runtime.inc.rs</code>；<code>deploy/cybergym_batch.py</code>、<code>compose.batch.yaml</code>；<code>docs/task-resume-design.md</code>、<code>docs/llm-retry-design.md</code>。图中阶段名与标记名均取自源码，未做改名。
+  </footer>
+</div>
+</body>
+</html>
