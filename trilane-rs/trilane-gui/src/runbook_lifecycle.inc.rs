@@ -81,6 +81,57 @@ impl RunbookState {
             })
     }
 
+    /// 结构化 PoC bundle：S5 打包结果，供控制器直接读取。
+    /// 它只是候选清单，不替代官方 /submit-vul 的差分验证。
+    pub fn poc_bundle(&self) -> serde_json::Value {
+        fn field(text: &str, key: &str) -> String {
+            let prefix = format!("{key}=");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        }
+
+        let source: Vec<&RunbookFinding> = if !self.stage5_poc_entries.is_empty() {
+            self.stage5_poc_entries.iter().collect()
+        } else {
+            self.findings
+                .iter()
+                .filter(|finding| finding.stage == "stage5")
+                .collect()
+        };
+        let candidates = source
+            .iter()
+            .map(|finding| {
+                let verification = field(&finding.detail, "verification");
+                let observed_exit = field(&finding.detail, "observed_exit");
+                serde_json::json!({
+                    "file": field(&finding.detail, "file"),
+                    "role": field(&finding.detail, "role"),
+                    "sha256": field(&finding.detail, "sha256"),
+                    "family": field(&finding.detail, "family"),
+                    "finding": finding.candidate_id.clone().unwrap_or_default(),
+                    "poc_id": finding.id,
+                    "severity": finding.severity,
+                    "title": finding.title,
+                    "code_path": finding.code_path,
+                    "replay": finding.payload,
+                    "verification": if verification.is_empty() {
+                        finding.evidence_state.clone()
+                    } else {
+                        verification
+                    },
+                    "observed_exit": observed_exit.parse::<i64>().ok(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": 1,
+            "generated": "trilane-s5",
+            "candidates": candidates,
+        })
+    }
+
     pub fn final_report_markdown(&self) -> String {
         let findings = if self.status == RunbookStatus::Error {
             self.final_findings.clone()

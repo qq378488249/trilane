@@ -496,6 +496,11 @@ impl RunbookState {
         let refs = marker_value(line, "evidence_refs")
             .or_else(|| marker_value(line, "refs"))
             .unwrap_or_default();
+        let role = marker_value(line, "role").unwrap_or_default();
+        let sha256 = marker_value(line, "sha256").unwrap_or_default();
+        let family = marker_value(line, "family").unwrap_or_default();
+        let observed_exit = marker_value(line, "observed_exit").unwrap_or_default();
+        let poc_file = marker_value(line, "file").unwrap_or_default();
         let verification =
             if requested_verification == "verified" && !self.poc_has_s4_control(source_id.as_deref(), &refs) {
                 "generated-not-verified".to_string()
@@ -517,7 +522,7 @@ impl RunbookState {
             );
         }
         let detail = format!(
-            "POC_ENTRY\npoc_id={poc_id}\ncategory={category}\ntarget={}\nprecondition={}\nexpected={}\nimpact={}\nverification={verification}\ncleanup={cleanup}\nevidence_refs={refs}",
+            "POC_ENTRY\npoc_id={poc_id}\ncategory={category}\ntarget={}\nprecondition={}\nexpected={}\nimpact={}\nverification={verification}\ncleanup={cleanup}\nevidence_refs={refs}\nrole={role}\nsha256={sha256}\nfamily={family}\nobserved_exit={observed_exit}\nfile={poc_file}",
             empty_dash(&target),
             empty_dash(&precondition),
             empty_dash(&expected),

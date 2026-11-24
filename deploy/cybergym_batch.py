@@ -1759,18 +1759,34 @@ def collect_pocs(
     found: dict[Path, PocCandidate] = {}
 
     # 1) 结构化 bundle：唯一能声明 role=final_candidate 的来源。
-    bundle_path = poc_dir / BUNDLE_FILE
-    if bundle_path.is_file():
+    #    agent 写 task/poc/bundle.json；引擎在 S5 结束后写 out/bundle.json（可能只有 replay）。
+    for bundle_path in (poc_dir / BUNDLE_FILE, out_dir / BUNDLE_FILE):
+        if not bundle_path.is_file():
+            continue
         try:
             bundle = json.loads(bundle_path.read_text(encoding="utf-8", errors="replace"))
         except json.JSONDecodeError:
-            bundle = {}
             _note(notes, "invalid_bundle", str(bundle_path.relative_to(task_root)))
+            continue
         for idx, entry in enumerate(bundle.get("candidates") or []):
             rel = str(entry.get("file") or "").strip()
-            path = _candidate_path(task_root, rel, base="task")
+            path = _candidate_path(task_root, rel, base="task") if rel else None
             if path is None:
-                _note(notes, "missing_candidate", rel)
+                for source_path in _payload_mount_sources(
+                    str(entry.get("replay") or "")
+                ):
+                    path = _candidate_path(task_root, source_path, base="task")
+                    if path is not None:
+                        rel = source_path
+                        break
+            if path is None:
+                _note(
+                    notes,
+                    "missing_candidate",
+                    rel or str(entry.get("replay") or "")[:120],
+                )
+                continue
+            if path in found:
                 continue
             role = str(entry.get("role") or ROLE_CANDIDATE).strip()
             if role not in VALID_ROLES:

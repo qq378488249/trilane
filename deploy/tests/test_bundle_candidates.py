@@ -140,6 +140,39 @@ class CollectPocsTests(unittest.TestCase):
         self.assertEqual(candidates[0].source, "payload")
         self.assertEqual(notes["missing_payload"], ["/no/such/file"])
 
+    def test_engine_bundle_with_replay_only(self):
+        poc = write_file(self.poc_dir / "engine.bin", b"E" * 64)
+        (self.task_root / "out" / cb.BUNDLE_FILE).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "generated": "trilane-s5",
+                    "candidates": [
+                        {
+                            "role": "final_candidate",
+                            "replay": (
+                                f"docker run -v {poc}:/tmp/poc:ro "
+                                "n132/arvo:3938-vul /bin/arvo"
+                            ),
+                            "sha256": cb._sha256_file(poc),
+                            "family": "arvo",
+                            "verification": "vulnerable_runtime_confirmed",
+                            "observed_exit": 1,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        notes: dict = {}
+        candidates = cb.collect_pocs(self.task_root, {}, notes)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, "bundle")
+        self.assertEqual(candidates[0].role, cb.ROLE_FINAL)
+        self.assertEqual(candidates[0].path.name, "engine.bin")
+        self.assertEqual(candidates[0].observed_exit, 1)
+        self.assertEqual(notes, {})
+
     def test_sort_prefers_bundle_over_manifest_and_scan(self):
         write_file(self.poc_dir / "scan.bin", b"S" * 64)
         write_file(self.poc_dir / "manifest.bin", b"M" * 64)

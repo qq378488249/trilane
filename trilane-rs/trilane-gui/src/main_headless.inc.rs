@@ -124,12 +124,30 @@ async fn write_headless_result(
 ) {
     let mut report_path: Option<String> = None;
     let mut stages = serde_json::Value::Null;
+    let _ = std::fs::create_dir_all(&options.out_dir);
     if let Some(runbook) = runbook {
         let markdown = runbook.final_report_markdown();
         if !markdown.trim().is_empty() {
             let path = options.out_dir.join("report.md");
             if std::fs::write(&path, markdown).is_ok() {
                 report_path = Some(path.display().to_string());
+            }
+        }
+        let bundle = runbook.poc_bundle();
+        let has_candidates = bundle
+            .get("candidates")
+            .and_then(|value| value.as_array())
+            .map(|values| !values.is_empty())
+            .unwrap_or(false);
+        if has_candidates {
+            if let Ok(text) = serde_json::to_string_pretty(&bundle) {
+                let _ = std::fs::write(options.out_dir.join("bundle.json"), &text);
+                if let Some(cwd) = options.cwd.as_deref() {
+                    let poc_dir = std::path::Path::new(cwd).join("poc");
+                    if std::fs::create_dir_all(&poc_dir).is_ok() {
+                        let _ = std::fs::write(poc_dir.join("bundle.json"), &text);
+                    }
+                }
             }
         }
         stages = serde_json::to_value(&runbook.stages).unwrap_or(serde_json::Value::Null);

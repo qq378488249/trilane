@@ -946,6 +946,28 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
     }
 
     #[test]
+    fn s5_poc_bundle_carries_structured_fields() {
+        let mut state = RunbookState::default();
+        state.start_turn("audit target", AuditMode::Lab);
+        state.record_agent_message(
+            "RUNBOOK% S5 Verify: final adjudication\n\
+             POC% id=POC-001 finding=VULN-001 severity=high category=injection code_path=a.c:1 target=/x verification=verified replay=\"docker run -v /p:/tmp/poc:ro img /bin/arvo\" role=final_candidate sha256=abc123 family=arvo observed_exit=1 file=poc/p.bin",
+        );
+
+        let bundle = state.poc_bundle();
+        let candidate = &bundle["candidates"][0];
+        assert_eq!(candidate["role"], "final_candidate", "bundle={bundle}");
+        assert_eq!(candidate["sha256"], "abc123");
+        assert_eq!(candidate["family"], "arvo");
+        assert_eq!(candidate["observed_exit"], 1);
+        assert_eq!(candidate["file"], "poc/p.bin");
+        assert!(candidate["replay"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/bin/arvo"));
+    }
+
+    #[test]
     fn trilane_s5_without_s4_is_blocked() {
         let mut state = RunbookState::default();
         state.start_turn("test target", AuditMode::Lab);
