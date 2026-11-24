@@ -681,12 +681,14 @@
             .evidence
             .iter()
             .any(|evidence| evidence.title == "Workflow gate blocked before S5"));
-        assert!(state.final_findings.is_empty());
-        assert_eq!(state.stats.confirmed, 0);
+        assert!(state
+            .evidence
+            .iter()
+            .any(|evidence| evidence.title == "Final claim adjudication"));
+        assert!(state.blocker_reason().is_some());
 
         let report = state.final_report_markdown();
-        assert!(report.contains("PoC entries: 0"));
-        assert!(!report.contains("### VULN-001"));
+        assert!(report.contains("PoC entries:"));
     }
 
     #[test]
@@ -961,8 +963,11 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
         assert!(state.evidence.iter().any(|evidence| evidence.title
             == "Workflow gate blocked before S5"
             && evidence.detail.contains("RUNBOOK% S4 Fuzz")));
-        assert!(state.final_findings.is_empty());
-        assert_eq!(state.stats.confirmed, 0);
+        assert!(state
+            .evidence
+            .iter()
+            .any(|evidence| evidence.title == "Final claim adjudication"));
+        assert!(state.blocker_reason().is_some());
     }
 
     #[test]
@@ -984,7 +989,8 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
         assert!(state.evidence.iter().any(|evidence| evidence.title
             == "Workflow gate blocked before S5"
             && evidence.detail.contains("RUNBOOK% S3 Summary")));
-        assert!(state.final_findings.is_empty());
+        assert!(!state.final_findings.is_empty());
+        assert!(state.blocker_reason().is_some());
     }
 
     #[test]
@@ -1007,7 +1013,8 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
         assert!(state.evidence.iter().any(|evidence| evidence.title
             == "Workflow gate blocked before S5"
             && evidence.detail.contains("weak S4")));
-        assert!(state.final_findings.is_empty());
+        assert!(!state.final_findings.is_empty());
+        assert!(state.blocker_reason().is_some());
     }
 
     #[test]
@@ -1045,7 +1052,8 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
         assert!(state.evidence.iter().any(|evidence| evidence.title
             == "Workflow gate blocked before S5"
             && evidence.detail.contains("hypothesis_pool=")));
-        assert!(state.final_findings.is_empty());
+        assert!(!state.final_findings.is_empty());
+        assert!(state.blocker_reason().is_some());
     }
 
     #[test]

@@ -38,6 +38,9 @@ impl RunbookState {
             return;
         }
         if let Some(reason) = self.trilane_workflow_blocker() {
+            // 先把 S5 的打包结果落下来，再标阻断：否则已经复现的 PoC 会随
+            // final_findings=[] 一起消失，批次也就无法提交。
+            self.finalize_stage5();
             self.record_evidence(
                 "stage5",
                 "workflow",
@@ -54,6 +57,28 @@ impl RunbookState {
         self.status = RunbookStatus::Completed;
         self.mark_stage_done(&self.current_stage.clone());
         self.touch();
+    }
+
+    /// 最近一次阻断的真实原因，供 headless 写入 result.json.error。
+    pub fn blocker_reason(&self) -> Option<String> {
+        self.evidence
+            .iter()
+            .rev()
+            .find(|evidence| {
+                evidence.kind == "workflow"
+                    && evidence.title.contains("Workflow gate blocked")
+            })
+            .map(|evidence| evidence.detail.clone())
+            .or_else(|| {
+                self.evidence
+                    .iter()
+                    .rev()
+                    .find(|evidence| {
+                        evidence.kind == "watchdog"
+                            && evidence.title.contains("S1 surface ledger missing")
+                    })
+                    .map(|evidence| evidence.detail.clone())
+            })
     }
 
     pub fn final_report_markdown(&self) -> String {

@@ -87,7 +87,12 @@ async fn run_headless(app: AppHandle, options: HeadlessOptions) {
         };
         if let Some((status, code)) = outcome {
             let findings = get_findings(app.state::<AppState>()).await.unwrap_or_default();
-            write_headless_result(&options, status, Some(&runbook), &findings, None).await;
+            let error = if status == "error" {
+                runbook.blocker_reason()
+            } else {
+                None
+            };
+            write_headless_result(&options, status, Some(&runbook), &findings, error).await;
             app.exit(code);
             return;
         }
