@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 mock-llm/
 tasks/
+local-test/
 .env
 .env.*
 report_from_results.sh

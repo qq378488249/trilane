@@ -53,6 +53,7 @@ deploy/dind/
 # 本地冒烟测试产物与密钥
 docker/smoke/
 deploy/trilane-home-hy4/
+deploy/local-test/
 
 # compose 本地跑批临时目录
 deploy/local-data/
