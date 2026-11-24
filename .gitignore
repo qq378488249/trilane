@@ -8,6 +8,7 @@ trilane-rs/target/
 # Frontend build output
 dist/
 trilane-rs/trilane-gui/frontend/dist/
+trilane-rs/trilane-gui/gen/schemas/linux-schema.json
 
 # Local npm release artifacts
 *.tgz
@@ -21,6 +22,7 @@ deploy/images/
 docker/*.tar.gz
 docker/rusty_v8/
 docker/cargo-git/
+docker/bin/
 
 # Logs and caches
 *.log
@@ -47,3 +49,12 @@ logs/
 runs/
 deploy/dind/
 *.tar.gz
+
+# 本地冒烟测试产物与密钥
+docker/smoke/
+deploy/trilane-home-hy4/
+
+# compose 本地跑批临时目录
+deploy/local-data/
+deploy/local-work/
+deploy/compose.batch.local.yaml

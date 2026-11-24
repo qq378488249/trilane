@@ -70,7 +70,17 @@ async fn start_agent(
 
     // SOP 读不到时会静默退化成一句兜底提示，跑批时无法判断到底用了哪份。
     // 这里把路径和字节数打出来，日志里就能确认内置 SOP 是否生效。
-    let sop_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sop/system_prompt_v4.md");
+    let sop_path = std::env::var_os("TRILANE_SOP_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let container =
+                std::path::PathBuf::from("/src/trilane-rs/trilane-gui/sop/system_prompt_v4.md");
+            if container.exists() {
+                container
+            } else {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sop/system_prompt_v4.md")
+            }
+        });
     let sop_prompt = match std::fs::read_to_string(&sop_path) {
         Ok(text) => {
             info!(

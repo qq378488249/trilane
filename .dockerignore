@@ -11,5 +11,7 @@ npm
 runs
 logs
 docker/*.tar.gz
+docker/cargo-git
+docker/rusty_v8
 deploy
 deploy.tar.gz
