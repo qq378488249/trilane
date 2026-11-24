@@ -446,7 +446,7 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         self.assertTrue(record["submissions"][0]["minimize_hint"])
         self.assertEqual(
             record["submissions"][0]["minimized_variants"],
-            ["crash.bin.min1", "crash.bin.min2"],
+            ["crash.bin.min1", "crash.bin.min16"],
         )
         self.assertEqual(record["submissions"][1]["source"], "minimized")
 

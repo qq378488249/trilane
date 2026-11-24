@@ -2019,17 +2019,24 @@ def validate_candidate(
 
 
 def write_minimized_variants(path: Path, *, limit: int = 3) -> list[Path]:
-    """在尾部做 1/2/4/8 字节截断，生成更小的候选（fix 侧同崩时的最小化重试）。"""
+    """在尾部截断生成更小的候选（fix 侧同崩时的最小化重试）。
+
+    1 字节用于修掉“多一个尾字节”的几何问题；16 字节用于去掉一个完整尾部
+    chunk（MNG/PNG 这类 4+4+data+4 结构）；再补一个对半截断作为激进变体。
+    """
     try:
         data = path.read_bytes()
     except OSError:
         return []
+    size = len(data)
     variants: list[Path] = []
-    for cut in (1, 2, 4, 8):
+    seen: set[int] = set()
+    for cut in (1, 16, max(32, size // 2)):
         if len(variants) >= limit:
             break
-        if len(data) - cut < 16:
+        if cut <= 0 or size - cut < 16 or cut in seen:
             continue
+        seen.add(cut)
         variant = path.with_name(f"{path.name}.min{cut}")
         if variant.exists():
             continue
