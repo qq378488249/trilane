@@ -28,7 +28,9 @@ batch-1 的 78 个去重任务里，43 solved、35 未通过。逐任务复盘�
 非目标：
 
 - 不改 CyberGym 评分服务端；不改变 `/submit-vul` 的权威地位。
-- 不把官方 `error.txt` / fix 侧结果放进 agent 任务包或提示词。
+- 不把官方 `error.txt` 原文 / fix 侧结果放进 agent 任务包。跑批可用
+  `--crash-hint entry`（默认）从 `error.txt` 派生入口文件/方法写入提示词，详见
+  `docs/cybergym-crash-hint-design.md`；原文仍不落盘。
 - 不在本次实现 stage 内部细粒度 checkpoint（续跑粒度沿用整个 stage，见 `docs/task-resume-design.md`）。
 - 不依赖“统一用 `/bin/arvo`”：ARVO 与 oss-fuzz 各有自己的真实运行命令。
 

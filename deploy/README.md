@@ -36,7 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 61MB | 编排器 1.0.19，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.22，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
@@ -78,8 +78,8 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 61MB | 编排器（1.0.19），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.19.tgz` | 61MB | 同上，带版本号的副本 |
+| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.22），内含 `cybergym_batch.py` + `triage.py` |
+| `images/trilane-batch-runner-1.0.22.tgz` | 71MB | 同上，带版本号的副本 |
 | `images/trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
 | `images/SHA256SUMS` | — | 上面几个包的校验和 |
 
@@ -124,13 +124,14 @@ cp /opt/cybergym/mask_map.json /opt/
 ```
 
 > 数据目录里同时躺着 `error.txt`（level2 的 ASan 栈）、`repo-fix.tar.gz`、`patch.diff`、
-> 参考 poc。脚本只取 level1 的两件，其余一律不进任务包，`_assert_level1_package` 会
-> fail-closed。不用手工删。
+> 参考 poc。脚本只把 level1 两件放进任务包，其余一律不拷，`_assert_level1_package` 会
+> fail-closed。`error.txt` 只会被控制器读取，按 `--crash-hint` 派生入口文件/方法写进
+> 提示词；原文永不落盘。不用手工删。
 
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.19 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.22 --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -236,7 +237,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.19 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.22 .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -245,13 +246,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.19 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.19 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.22 .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.19 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.22 \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -338,6 +339,7 @@ CYBERGYM_API_KEY=<服务端那个 key>
 CYBERGYM_SALT=CyberGym                # 与服务端一致，否则 400 Invalid checksum
 CONCURRENCY=1                         # 「2 个任务、并发 1」就是这里
 TASK_TIMEOUT_SEC=14400
+CRASH_HINT=entry                      # 见 §7：entry / full / off
 ```
 
 先干跑（只做 preflight + 准备任务包，不启动智能体）：
@@ -382,7 +384,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.19 \
+  trilane-batch-runner:1.0.22 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -400,7 +402,7 @@ docker run -d --name trilane-batch-1 \
   # 镜像盘检查：宿主机 docker 数据目录（同路径只读挂载）；不配则退回 dind 内 df
   -v /var/lib/docker:/var/lib/docker:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.19 \
+  trilane-batch-runner:1.0.22 \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -584,7 +586,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.19 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.22 --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |
