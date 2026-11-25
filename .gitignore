@@ -55,5 +55,6 @@ docker/smoke/
 
 # compose 本地跑批配置与日志
 deploy/local-test/
+deploy/tasks/
 deploy/trilane-home-hy4/
 deploy/compose.batch.local.yaml
