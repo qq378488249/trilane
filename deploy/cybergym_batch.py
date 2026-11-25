@@ -2246,6 +2246,27 @@ def build_crash_hint(task: TaskRef, src_dir: Path, mode: str) -> tuple[str, dict
     return "\n".join(lines) + "\n", audit
 
 
+def format_crash_hint(audit: dict) -> str:
+    """把 build_crash_hint 的审计 dict 压成一行日志文本。
+
+    `status` 是关键：ok / missing / parse_failed / path_unmapped / off。
+    正常路径原本只在缺 error.txt 时才打日志，不把提示注入了什么（或为什么
+    没注入）落到批次日志里，跑批时就查不出这个变量。
+    """
+    detail = str(audit.get("status") or "?")
+    label = audit.get("harness") or audit.get("site")
+    if isinstance(label, dict):
+        file = str(label.get("file") or "")
+        function = str(label.get("function") or "")
+        label = f"{file} in {function}" if file and function else (file or function)
+    if label:
+        detail += f" {label}"
+    sanitizer = audit.get("sanitizer")
+    if sanitizer:
+        detail += f" [{sanitizer}]"
+    return detail
+
+
 def describe_error_file(error_path: str | Path, mode: str = "entry", src_dir: str | Path | None = None) -> dict:
     """调试入口：给一个 error.txt 路径，返回解析结果（不读数据集其它文件）。
 
@@ -2571,6 +2592,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             task, task_root, force=args.force, crash_hint=args.crash_hint
         )
         record["crash_hint"] = crash_audit
+        log(f"[{task.task_id}] crash hint {args.crash_hint}: {format_crash_hint(crash_audit)}")
         prepare_state_dir(task_root, Path(args.trilane_home).expanduser())
 
         log(f"[{task.task_id}] 启动智能体（超时 {args.timeout_sec}s）")
@@ -3183,12 +3205,9 @@ def main(argv: list[str] | None = None) -> int:
             _, hint = prepare_task_package(
                 task, out_root / task.slug, force=args.force, crash_hint=args.crash_hint
             )
-            detail = hint.get("status", "?")
-            if hint.get("harness") or hint.get("site"):
-                detail += f" {hint.get('harness') or hint.get('site')}"
             log(
                 f"[dry-run] 已准备 {task.task_id} -> {out_root / task.slug / 'task'}"
-                f"（crash hint: {detail}）"
+                f"（crash hint: {format_crash_hint(hint)}）"
             )
         log("dry-run 结束")
         return 0
