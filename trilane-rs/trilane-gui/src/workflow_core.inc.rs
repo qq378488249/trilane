@@ -136,7 +136,21 @@ impl TriLaneWorkflow {
             ));
         }
 
+        // S5 bundle 字段是 runner 消费的结构化契约。缺失时先要求补一次，
+        // 但修复次数用尽后仍放行：字段不全不该阻断整条流程，最终由 runner
+        // 的真实差分回放判定。
+        let s5_schema_pending = matches!(
+            phase.gate,
+            PhaseGate::S5Adjudicate | PhaseGate::S5FinalRevision
+        ) && !state.poc_bundle_schema_issues().is_empty();
+
         if phase_satisfied(phase, self.phase_start, state) {
+            if s5_schema_pending
+                && self.repairs_for_current < max_repairs_for_phase(phase, state)
+            {
+                self.repairs_for_current += 1;
+                return self.submit_current(state, true);
+            }
             self.current += 1;
             self.repairs_for_current = 0;
             self.progress_repairs_for_current = 0;
@@ -328,12 +342,12 @@ fn phase_repair_instruction(phase: &WorkflowPhase, _state: &RunbookState) -> Str
         phase.id,
         "s5_adversarial_review" | "s5_final_revision"
     ) {
-        return "\nWORKFLOW_REPAIR% This phase is output-only and the previous turn executed tools. Do not call tools, run commands, inspect source, or probe. Re-emit the required REVIEW%/POC% rows from the supplied context only.\n".to_string();
+        return "\nWORKFLOW_REPAIR% This phase is output-only. Do not call tools, run commands, inspect source, or probe. Re-emit the complete POC% replacement set from the supplied context. If a containerized POC% row (replay mounts /tmp/poc) is missing file=, role=, or observed_exit=, copy them from the draft row or ledger evidence instead of dropping the row.\n".to_string();
     }
     if phase.gate == PhaseGate::S3Merge {
         return "\nWORKFLOW_REPAIR% S3 did not produce a clean output-only claim/debt handoff or it used commands. Do not call tools. Re-read only RUNBOOK_CONTEXT, then emit RUNBOOK% S3 Summary plus bare CLAIM%/MERGE%/CHAIN_CANDIDATE%/BREADTH% rows. Reuse input ids exactly, keep unresolved obligation rows as CLAIM% status=debt when still in scope, and do not emit DUPLICATE%, PROBE%, CONTROL%, VERIFY%, REJECTED%, FINDING%, markdown tables, or prose.\n".to_string();
     }
-    "\nWORKFLOW_REPAIR% The previous turn did not satisfy this phase contract. Do not apologize. Emit the missing machine-readable ledger lines now, then continue only within this same phase.\n".to_string()
+    "\nWORKFLOW_REPAIR% The previous turn did not satisfy this phase contract. Do not apologize. Emit the missing machine-readable ledger lines now, then continue only within this same phase. If a containerized POC% row (replay mounts /tmp/poc) lacks file=, role=, or observed_exit=, fill them from the supplied ledger evidence before re-emitting the row.\n".to_string()
 }
 
 fn phase_progressed(phase: &WorkflowPhase, baseline: WorkflowCounters, state: &RunbookState) -> bool {

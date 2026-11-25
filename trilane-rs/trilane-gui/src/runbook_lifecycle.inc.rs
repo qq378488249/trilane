@@ -1,3 +1,21 @@
+fn compute_sha256(workspace: Option<&std::path::Path>, file: &str) -> Option<String> {
+    if file.trim().is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(file);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        workspace?.join(path)
+    };
+    if !resolved.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&resolved).ok()?;
+    let digest = Sha256::digest(&bytes);
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 impl RunbookState {
     pub fn start_turn(&mut self, objective: &str, audit_mode: AuditMode) {
         let next_revision = self.revision.saturating_add(1);
@@ -83,53 +101,117 @@ impl RunbookState {
 
     /// 结构化 PoC bundle：S5 打包结果，供控制器直接读取。
     /// 它只是候选清单，不替代官方 /submit-vul 的差分验证。
-    pub fn poc_bundle(&self) -> serde_json::Value {
-        fn field(text: &str, key: &str) -> String {
-            let prefix = format!("{key}=");
-            text.lines()
-                .find_map(|line| line.strip_prefix(&prefix))
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default()
-        }
+    ///
+    /// `workspace` 用于把 `file=` 解析成真实文件并计算 sha256；拿不到时
+    /// 保留声明值，runner 仍会按实际文件重算。
+    pub fn poc_bundle(&self, workspace: Option<&std::path::Path>) -> serde_json::Value {
+        let candidates = self
+            .s5_bundle_source()
+            .iter()
+            .map(|finding| {
+                let declared_verification = detail_field(&finding.detail, "verification");
+                let verification = if declared_verification.is_empty() {
+                    finding.evidence_state.clone()
+                } else {
+                    declared_verification
+                };
+                let replay = finding.payload.clone();
+                let file = bundle_file_from_detail(&finding.detail, &replay);
+                let sha256 = compute_sha256(workspace, &file)
+                    .or_else(|| {
+                        let declared = detail_field(&finding.detail, "sha256");
+                        (!declared.is_empty()).then_some(declared)
+                    })
+                    .unwrap_or_default();
+                let role = normalize_bundle_role(&detail_field(&finding.detail, "role"))
+                    .unwrap_or_else(|| {
+                        if is_verified_verification(&verification) && !file.is_empty() {
+                            "candidate".to_string()
+                        } else {
+                            "diagnostic".to_string()
+                        }
+                    });
+                serde_json::json!({
+                    "file": file,
+                    "role": role,
+                    "sha256": sha256,
+                    "family": detail_field(&finding.detail, "family"),
+                    "finding": finding.candidate_id.clone().unwrap_or_default(),
+                    "poc_id": finding.id,
+                    "severity": finding.severity,
+                    "title": finding.title,
+                    "code_path": finding.code_path,
+                    "replay": replay,
+                    "verification": verification,
+                    "observed_exit": parse_observed_exit(
+                        &detail_field(&finding.detail, "observed_exit"),
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
 
-        let source: Vec<&RunbookFinding> = if !self.stage5_poc_entries.is_empty() {
+        // 不自动把第一个候选提升为 final_candidate：runner 对 final_candidate 的
+        // no_crash 会提前收手，而引擎的顺序不一定等于最优顺序（arvo:58364 的
+        // 第二个候选才是官方入口）。final_candidate 只由 agent 显式声明。
+        serde_json::json!({
+            "schema": 1,
+            "generated": "trilane-s5",
+            "candidates": candidates,
+        })
+    }
+
+    /// S5 bundle 的最低 schema 检查：只对 `/tmp/poc` 形态的候选生效。
+    ///
+    /// 返回空表示可进入下一阶段；否则 workflow 会发起一次 repair，要求 agent
+    /// 补齐字段。修复次数用尽后仍会放行，最终由 runner 的真实回放判定，
+    /// 避免字段问题阻断整条流程。
+    pub fn poc_bundle_schema_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        for finding in self.s5_bundle_source() {
+            let replay = finding.payload.trim();
+            if !is_container_poc_replay(replay) {
+                continue;
+            }
+            let file = bundle_file_from_detail(&finding.detail, replay);
+            let verification = {
+                let declared = detail_field(&finding.detail, "verification");
+                if declared.is_empty() {
+                    finding.evidence_state.clone()
+                } else {
+                    declared
+                }
+            };
+            if file.is_empty() {
+                issues.push(format!(
+                    "{}: missing file= (or -v <path>:/tmp/poc in replay)",
+                    finding.id
+                ));
+            }
+            let role = detail_field(&finding.detail, "role");
+            if role.is_empty() {
+                issues.push(format!("{}: missing role=", finding.id));
+            }
+            if is_verified_verification(&verification)
+                && parse_observed_exit(&detail_field(&finding.detail, "observed_exit")).is_none()
+            {
+                issues.push(format!(
+                    "{}: missing observed_exit= for verified candidate",
+                    finding.id
+                ));
+            }
+        }
+        issues
+    }
+
+    fn s5_bundle_source(&self) -> Vec<&RunbookFinding> {
+        if !self.stage5_poc_entries.is_empty() {
             self.stage5_poc_entries.iter().collect()
         } else {
             self.findings
                 .iter()
                 .filter(|finding| finding.stage == "stage5")
                 .collect()
-        };
-        let candidates = source
-            .iter()
-            .map(|finding| {
-                let verification = field(&finding.detail, "verification");
-                let observed_exit = field(&finding.detail, "observed_exit");
-                serde_json::json!({
-                    "file": field(&finding.detail, "file"),
-                    "role": field(&finding.detail, "role"),
-                    "sha256": field(&finding.detail, "sha256"),
-                    "family": field(&finding.detail, "family"),
-                    "finding": finding.candidate_id.clone().unwrap_or_default(),
-                    "poc_id": finding.id,
-                    "severity": finding.severity,
-                    "title": finding.title,
-                    "code_path": finding.code_path,
-                    "replay": finding.payload,
-                    "verification": if verification.is_empty() {
-                        finding.evidence_state.clone()
-                    } else {
-                        verification
-                    },
-                    "observed_exit": observed_exit.parse::<i64>().ok(),
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "schema": 1,
-            "generated": "trilane-s5",
-            "candidates": candidates,
-        })
+        }
     }
 
     pub fn final_report_markdown(&self) -> String {

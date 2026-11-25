@@ -114,6 +114,7 @@ class CollectPocsTests(unittest.TestCase):
         candidates = cb.collect_pocs(self.task_root, {}, notes)
         names = {candidate.path.name for candidate in candidates}
         self.assertEqual(names, {"real.bin"})
+        self.assertFalse(candidates[0].submittable)
         self.assertIn("scan_too_small", notes)
         self.assertIn("scan_control_skipped", notes)
 
@@ -138,6 +139,7 @@ class CollectPocsTests(unittest.TestCase):
         candidates = cb.collect_pocs(self.task_root, result, notes)
         self.assertEqual([c.path.name for c in candidates], ["from_payload.bin"])
         self.assertEqual(candidates[0].source, "payload")
+        self.assertFalse(candidates[0].submittable)
         self.assertEqual(notes["missing_payload"], ["/no/such/file"])
 
     def test_engine_bundle_with_replay_only(self):
@@ -171,7 +173,66 @@ class CollectPocsTests(unittest.TestCase):
         self.assertEqual(candidates[0].role, cb.ROLE_FINAL)
         self.assertEqual(candidates[0].path.name, "engine.bin")
         self.assertEqual(candidates[0].observed_exit, 1)
+        self.assertTrue(candidates[0].submittable)
         self.assertEqual(notes, {})
+
+    def test_bundle_replay_pwd_prefix_is_resolved(self):
+        """replay 里 `cd task && ... -v $PWD/poc/x.bin` 也要能定位到候选。"""
+        write_file(self.poc_dir / "pwd.bin", b"W" * 64)
+        (self.poc_dir / cb.BUNDLE_FILE).write_text(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "role": "candidate",
+                            "replay": (
+                                "cd task && docker run --rm "
+                                "-v $PWD/poc/pwd.bin:/tmp/poc:ro "
+                                "n132/arvo:3938-vul /bin/arvo"
+                            ),
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        notes: dict = {}
+        candidates = cb.collect_pocs(self.task_root, {}, notes)
+        self.assertEqual([c.path.name for c in candidates], ["pwd.bin"])
+        self.assertEqual(candidates[0].source, "bundle")
+        self.assertTrue(candidates[0].submittable)
+        self.assertEqual(notes.get("missing_candidate"), None)
+
+    def test_evidence_refs_are_diagnostic_only(self):
+        write_file(self.poc_dir / "run.log", b"L" * 64)
+        result = {
+            "findings": [
+                {"id": "VULN-001", "description": "evidence_refs=poc/run.log"}
+            ]
+        }
+        candidates = cb.collect_pocs(self.task_root, result)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, "evidence_refs")
+        self.assertFalse(candidates[0].submittable)
+
+    def test_restore_attempt_restores_bundle_and_manifest(self):
+        attempt = self.task_root / cb.ARTIFACTS_DIR / "attempt-1"
+        (attempt / "poc").mkdir(parents=True)
+        (attempt / "poc" / cb.BUNDLE_FILE).write_text(
+            '{"candidates": []}', encoding="utf-8"
+        )
+        (attempt / "poc" / "manifest.json").write_text(
+            '{"pocs": []}', encoding="utf-8"
+        )
+        (attempt / "candidates.json").write_text(
+            '{"schema": 1, "candidates": []}', encoding="utf-8"
+        )
+
+        restored = cb.restore_attempt_candidates(self.task_root)
+
+        self.assertEqual(restored, 2)
+        self.assertTrue((self.poc_dir / cb.BUNDLE_FILE).is_file())
+        self.assertTrue((self.poc_dir / "manifest.json").is_file())
 
     def test_sort_prefers_bundle_over_manifest_and_scan(self):
         write_file(self.poc_dir / "scan.bin", b"S" * 64)
@@ -381,8 +442,7 @@ class RunOneCandidateLoopTests(unittest.TestCase):
                             {
                                 "file": "poc/final.bin",
                                 "role": "final_candidate",
-                                "sha256": "0" * 64,
-                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                                "replay": "docker run -v /poc:/tmp/poc:ro img",
                                 "observed_exit": 1,
                             }
                         ]
@@ -401,7 +461,132 @@ class RunOneCandidateLoopTests(unittest.TestCase):
                 self.task, self._args(), ExplodingClient(), self.work_root
             )
         self.assertEqual(record["status"], "bundle_invalid")
-        self.assertEqual(record["bundle_invalid"][0]["issues"], ["sha256_mismatch"])
+        self.assertEqual(record["bundle_invalid"][0]["issues"], ["missing_bin_arvo"])
+        self.assertEqual(record["submissions"], [])
+
+    def test_sha256_mismatch_is_submitted_with_warning(self):
+        """声明哈希算错不应丢掉候选；runner 本就用实际文件哈希。"""
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "file": "poc/final.bin",
+                                "role": "final_candidate",
+                                "sha256": "0" * 64,
+                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                                "observed_exit": 1,
+                                "verification": "verified",
+                            }
+                        ]
+                    }
+                ).encode(),
+                "final.bin": b"F" * 64,
+            }
+        )
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task,
+                self._args(),
+                self._client({"final.bin": ("solved", 1, 0)}),
+                self.work_root,
+            )
+        self.assertEqual(record["status"], "solved")
+        self.assertIn("sha256_mismatch", record["submissions"][0]["warnings"])
+
+    def test_missing_observed_exit_candidate_is_still_submitted(self):
+        """arvo:58364/62388/63163 的回归：缺 observed_exit 不能判 invalid。"""
+        fake = self._fake_agent(
+            {
+                cb.BUNDLE_FILE: json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "file": "poc/vuln.bin",
+                                "role": "candidate",
+                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                                "verification": "verified",
+                            }
+                        ]
+                    }
+                ).encode(),
+                "vuln.bin": b"V" * 64,
+            }
+        )
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task,
+                self._args(),
+                self._client({"vuln.bin": ("solved", 1, 0)}),
+                self.work_root,
+            )
+        self.assertEqual(record["status"], "solved")
+        self.assertIn(
+            "missing_observed_exit", record["submissions"][0]["warnings"]
+        )
+
+    def test_diagnostic_only_sources_are_not_submitted(self):
+        """bundle invalid 时不得回退到 .log / evidence.md / corpus。"""
+
+        def fake(task, task_root, args):
+            poc_dir = task_root / "task" / "poc"
+            write_file(poc_dir / "run.log", b"not a poc" * 16)
+            write_file(poc_dir / "seed.bin", b"S" * 64)
+            (poc_dir / cb.BUNDLE_FILE).write_text(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "file": "poc/missing.bin",
+                                "role": "final_candidate",
+                                "replay": "docker run -v /poc:/tmp/poc:ro img /bin/arvo",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return cb.RunOutcome(
+                "completed",
+                0,
+                10.0,
+                {
+                    "status": "completed",
+                    "findings": [
+                        {
+                            "id": "VULN-001",
+                            "description": "evidence_refs=poc/run.log",
+                        }
+                    ],
+                },
+                "",
+            )
+
+        class ExplodingClient:
+            def evaluate(self, **_kwargs):
+                raise AssertionError("diagnostic sources must not be submitted")
+
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task, self._args(), ExplodingClient(), self.work_root
+            )
+        self.assertEqual(record["status"], "bundle_invalid")
+        self.assertEqual(record["submissions"], [])
+        self.assertTrue(record["diagnostic_only"])
+
+    def test_no_bundle_but_scan_candidates_reports_no_poc(self):
+        fake = self._fake_agent({"seed.bin": b"S" * 64})
+
+        class ExplodingClient:
+            def evaluate(self, **_kwargs):
+                raise AssertionError("scan candidates must not be submitted")
+
+        with mock.patch.object(cb, "run_agent", fake):
+            record = cb.run_one(
+                self.task, self._args(), ExplodingClient(), self.work_root
+            )
+        self.assertEqual(record["status"], "no_poc")
         self.assertEqual(record["submissions"], [])
 
     def test_fix_also_crashes_retries_truncated_variant(self):
@@ -598,7 +783,11 @@ class CrashSignatureTests(unittest.TestCase):
         task = cb.TaskRef(
             "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
         )
-        self.assertEqual(cb.validate_candidate(self.task_root, task, self._candidate()), [])
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, self._candidate()
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(warnings, [])
 
     def test_validate_rejects_missing_mount_and_entrypoint(self):
         task = cb.TaskRef(
@@ -607,15 +796,30 @@ class CrashSignatureTests(unittest.TestCase):
         missing_mount = self._candidate(
             replay="docker run img /bin/arvo"
         )
-        self.assertIn(
-            "missing_poc_mount", cb.validate_candidate(self.task_root, task, missing_mount)
-        )
+        issues, _ = cb.validate_candidate(self.task_root, task, missing_mount)
+        self.assertIn("missing_poc_mount", issues)
         missing_bin = self._candidate(
             replay="docker run -v /poc:/tmp/poc:ro img"
         )
-        self.assertIn(
-            "missing_bin_arvo", cb.validate_candidate(self.task_root, task, missing_bin)
+        issues, _ = cb.validate_candidate(self.task_root, task, missing_bin)
+        self.assertIn("missing_bin_arvo", issues)
+
+    def test_validate_reads_all_mounts_not_only_first(self):
+        """tracer 挂在前面、PoC 挂在后面时不能误报 missing_poc_mount（arvo:62183）。"""
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
         )
+        candidate = self._candidate(
+            replay=(
+                "docker run --rm -v /host/task/trace/tracer_fdiv:/trace:ro "
+                "-v /host/task/poc/p.bin:/tmp/poc:ro --network none img /bin/arvo"
+            )
+        )
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(warnings, [])
 
     def test_validate_oss_fuzz_rejects_bin_arvo(self):
         task = cb.TaskRef(
@@ -624,20 +828,31 @@ class CrashSignatureTests(unittest.TestCase):
         candidate = self._candidate(
             replay="docker run -v /poc:/tmp/poc:ro img /bin/arvo"
         )
-        self.assertIn(
-            "unexpected_bin_arvo_for_oss_fuzz",
-            cb.validate_candidate(self.task_root, task, candidate),
-        )
+        issues, _ = cb.validate_candidate(self.task_root, task, candidate)
+        self.assertIn("unexpected_bin_arvo_for_oss_fuzz", issues)
 
-    def test_validate_requires_observed_exit_for_confirmed(self):
+    def test_missing_observed_exit_is_warning_only(self):
+        """observed_exit 缺失只记警告：官方向量本来会在 vul/fix 两侧重跑。"""
         task = cb.TaskRef(
             "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
         )
         candidate = self._candidate(observed_exit=None)
-        self.assertIn(
-            "missing_observed_exit",
-            cb.validate_candidate(self.task_root, task, candidate),
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
         )
+        self.assertEqual(issues, [])
+        self.assertIn("missing_observed_exit", warnings)
+
+    def test_declared_sha256_mismatch_is_warning_only(self):
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
+        )
+        candidate = self._candidate(declared_sha256="0" * 64)
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
+        )
+        self.assertEqual(issues, [])
+        self.assertIn("sha256_mismatch", warnings)
 
 
 if __name__ == "__main__":

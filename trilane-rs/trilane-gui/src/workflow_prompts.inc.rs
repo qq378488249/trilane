@@ -9,6 +9,7 @@ fn phase_context(phase: &WorkflowPhase, state: &RunbookState, objective: &str) -
              - Accept drop/merge only for same-family duplicates, ledger contradictions, out-of-scope items, placeholders, or non-security observations.\n\
              - For missing live proof, weak replay, or uncertain impact, downgrade/rewrite to generated-not-verified or needs-poc instead of deleting.\n\
              - Preserve finding= and evidence_refs= from a draft POC% row unless REVIEW_CONTEXT proves they are wrong.\n\
+             - Preserve file=, role=, observed_exit=, sha256=, and family= whenever the replacement keeps that row; a containerized row (replay mounts /tmp/poc) must never lose observed_exit=.\n\
              - Quote target/precondition/replay/expected/impact/evidence_refs when values contain spaces, shell quotes, JSON, semicolons, arrows, or angle brackets.\n\
              - Verified rows need copyable replay commands or compact ordered steps; placeholder-only replay must be needs-poc or generated-not-verified.\n\
              - Do not invent PoCs beyond REVIEW% add_check items with an evidence_ref already present in RUNBOOK_CONTEXT.\n\
@@ -239,10 +240,11 @@ fn s5_review_lane_prompt(objective: &str, state: &RunbookState, is_repair: bool)
          USER_OBJECTIVE%\n{}\n\
          {repair}\n\
          RUNBOOK_CONTEXT%\n{}\n\n\
+         S5_BUNDLE_JSON%\n{}\n\n\
          FINAL_POC_BUNDLE_DRAFT%\n{}\n\n\
          AGENT_RULES%\n{}\n\n\
          REVIEW_TASK%\n\
-         Review the draft PoC bundle after S5 adjudication. You are a bounded advisory PoC reviewer, not a new auditor and not the final decision-maker. Do not run tools, inspect source files, perform fresh probing, do a broad new scan, or rewrite the bundle yourself. Focus only on duplicate PoCs, missing replay steps, weak expected signals, unsupported severity inflation, unsafe cleanup/side effects, source-backed entries incorrectly marked verified, missing high-value families already supported by RUNBOOK_CONTEXT, and unclear evidence references. Favor recall-preserving advice: when evidence is incomplete but source/root-cause impact is plausible, recommend generated-not-verified or needs-poc instead of drop.\n\n\
+         Review the draft PoC bundle after S5 adjudication. You are a bounded advisory PoC reviewer, not a new auditor and not the final decision-maker. Do not run tools, inspect source files, perform fresh probing, do a broad new scan, or rewrite the bundle yourself. Focus only on duplicate PoCs, missing replay steps, weak expected signals, unsupported severity inflation, unsafe cleanup/side effects, source-backed entries incorrectly marked verified, missing high-value families already supported by RUNBOOK_CONTEXT, and unclear evidence references. Also flag containerized PoC rows (replay mounts /tmp/poc) whose S5_BUNDLE_JSON entry lacks file, an allowed role, observed_exit for a verified row, or a copyable replay. Favor recall-preserving advice: when evidence is incomplete but source/root-cause impact is plausible, recommend generated-not-verified or needs-poc instead of drop.\n\n\
          OUTPUT_CONTRACT%\n\
          - Emit compact machine-readable review comments only: REVIEW% action=<keep|merge|drop|downgrade|upgrade|add_check|rewrite> target=<VULN-id-or-claim-id-or-family> reason=<short> evidence_ref=<claim-or-finding-id> confidence=<high|medium|low>.\n\
          - High-confidence REVIEW% comments must be directly actionable by the main agent without extra source reads.\n\
@@ -254,6 +256,7 @@ fn s5_review_lane_prompt(objective: &str, state: &RunbookState, is_repair: bool)
          - Finish with exactly one REVIEW_REPORT% lane=poc_bundle_review status=done comments=<n> critical=<n> note=<short> line.\n",
         objective.trim(),
         compact_claim_packet(state, /*max_items*/ 120),
+        serde_json::to_string_pretty(&state.poc_bundle(None)).unwrap_or_default(),
         truncate_chars(&state.final_report_markdown(), 45_000),
         stage_agent_rules("S5", "s5_adversarial_review"),
     )

@@ -954,7 +954,7 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
              POC% id=POC-001 finding=VULN-001 severity=high category=injection code_path=a.c:1 target=/x verification=verified replay=\"docker run -v /p:/tmp/poc:ro img /bin/arvo\" role=final_candidate sha256=abc123 family=arvo observed_exit=1 file=poc/p.bin",
         );
 
-        let bundle = state.poc_bundle();
+        let bundle = state.poc_bundle(None);
         let candidate = &bundle["candidates"][0];
         assert_eq!(candidate["role"], "final_candidate", "bundle={bundle}");
         assert_eq!(candidate["sha256"], "abc123");
@@ -965,6 +965,83 @@ VERIFY% id=XSS-CAND-01 exploit="script payload executes" root_cause=routes/searc
             .as_str()
             .unwrap_or_default()
             .contains("/bin/arvo"));
+    }
+
+    #[test]
+    fn s5_bundle_fields_survive_detail_truncation() {
+        let long_target = "x".repeat(900);
+        let mut state = RunbookState::default();
+        state.start_turn("audit target", AuditMode::Lab);
+        state.record_evidence(
+            "stage4",
+            "verify",
+            "verify VULN-001",
+            "VERIFY% id=VULN-001 exit=1".to_string(),
+        );
+        state.record_evidence(
+            "stage4",
+            "control",
+            "control VULN-001",
+            "CONTROL% id=VULN-001 exit=0".to_string(),
+        );
+        state.record_agent_message(&format!(
+            "RUNBOOK% S5 Verify: final adjudication\n\
+             POC% id=POC-001 finding=VULN-001 severity=high category=injection code_path=a.c:1 target=\"{long_target}\" verification=verified replay=\"docker run -v /p/p.bin:/tmp/poc:ro img /bin/arvo\" role=positive-poc sha256=abc123 family=arvo observed_exit=1 file=poc/p.bin"
+        ));
+
+        let bundle = state.poc_bundle(None);
+        let candidate = &bundle["candidates"][0];
+        assert_eq!(candidate["file"], "poc/p.bin", "bundle={bundle}");
+        assert_eq!(candidate["role"], "candidate");
+        assert_eq!(candidate["observed_exit"], 1);
+        assert_eq!(candidate["sha256"], "abc123");
+        assert!(
+            state.poc_bundle_schema_issues().is_empty(),
+            "{:?}",
+            state.poc_bundle_schema_issues()
+        );
+    }
+
+    #[test]
+    fn s5_bundle_schema_flags_missing_observed_exit() {
+        let mut state = RunbookState::default();
+        state.start_turn("audit target", AuditMode::Lab);
+        state.record_evidence(
+            "stage4",
+            "verify",
+            "verify VULN-001",
+            "VERIFY% id=VULN-001 exit=1".to_string(),
+        );
+        state.record_evidence(
+            "stage4",
+            "control",
+            "control VULN-001",
+            "CONTROL% id=VULN-001 exit=0".to_string(),
+        );
+        state.record_agent_message(
+            "RUNBOOK% S5 Verify: final adjudication\n\
+             POC% id=POC-001 finding=VULN-001 severity=high category=injection code_path=a.c:1 target=/x verification=verified replay=\"docker run -v /p:/tmp/poc:ro img /bin/arvo\" role=candidate file=poc/p.bin",
+        );
+
+        let issues = state.poc_bundle_schema_issues();
+        assert!(
+            issues.iter().any(|issue| issue.contains("observed_exit")),
+            "{issues:?}"
+        );
+        let bundle = state.poc_bundle(None);
+        assert_eq!(bundle["candidates"][0]["file"], "poc/p.bin");
+    }
+
+    #[test]
+    fn s5_bundle_schema_ignores_web_replays() {
+        let mut state = RunbookState::default();
+        state.start_turn("audit target", AuditMode::Lab);
+        state.record_agent_message(
+            "RUNBOOK% S5 Verify: final adjudication\n\
+             POC% id=POC-001 finding=VULN-001 severity=medium category=auth code_path=routes/x.ts:1 target=/x verification=generated-not-verified replay=\"curl -s http://localhost/x\" expected=200",
+        );
+
+        assert!(state.poc_bundle_schema_issues().is_empty());
     }
 
     #[test]

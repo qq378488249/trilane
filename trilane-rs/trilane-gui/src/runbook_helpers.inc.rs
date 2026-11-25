@@ -135,6 +135,11 @@ fn marker_value(line: &str, key: &str) -> Option<String> {
         " evidence_refs=",
         " refs=",
         " score=",
+        // agent 常用这些同义键名描述 PoC 信号/对照/大小；不列出来会把整段
+        // `signal=... control=...` 吞进前一个字段（arvo:62388 的 replay 就中过）。
+        " signal=",
+        " control=",
+        " size=",
     ];
     let end = keys
         .iter()
@@ -513,4 +518,119 @@ fn append_compact(existing: &str, incoming: &str, max_chars: usize) -> String {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+// --------------------------------------------------------------------------- //
+// Structured PoC bundle helpers
+//
+// S5 的 POC% 行同时服务人类报告和 runner 的结构化 bundle。以下 helper 负责把
+// agent 的自由写法收敛成 runner 能消费的值；任何派生都不要猜测，只做清洗。
+// --------------------------------------------------------------------------- //
+
+/// 清洗 marker 值：去引号/反引号，把 none/null/n/a 等占位值视为空。
+fn clean_bundle_value(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('`').trim();
+    let unquoted = strip_balanced_outer_quotes(trimmed).trim();
+    let lower = unquoted.to_ascii_lowercase();
+    if lower.is_empty()
+        || matches!(
+            lower.as_str(),
+            "none" | "null" | "n/a" | "na" | "-" | "unknown" | "tbd"
+        )
+    {
+        String::new()
+    } else {
+        unquoted.to_string()
+    }
+}
+
+/// POC% 的 replay 是否是“容器化 fuzz 候选”形态（挂载 /tmp/poc）。
+/// 只有这种形态才要求 file/role/observed_exit；web 任务的 curl replay 不受影响。
+fn is_container_poc_replay(replay: &str) -> bool {
+    replay.contains(":/tmp/poc") || replay.contains(" /tmp/poc")
+}
+
+/// 从 docker run 的 `-v <path>:/tmp/poc` 反推候选文件路径。
+fn poc_file_from_replay(replay: &str) -> Option<String> {
+    for token in replay.split_whitespace() {
+        let value = token.trim_matches(|ch| ch == '\'' || ch == '"').to_string();
+        let value = value
+            .strip_prefix("--volume=")
+            .or_else(|| value.strip_prefix("-v="))
+            .unwrap_or(value.as_str());
+        if let Some(idx) = value.find(":/tmp/poc") {
+            let source = value[..idx].trim();
+            if !source.is_empty() {
+                return Some(source.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 把 agent 写的 role 收敛到 runner 的 VALID_ROLES 词表。
+fn normalize_bundle_role(raw: &str) -> Option<String> {
+    let value = clean_bundle_value(raw)
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = match value.as_str() {
+        "final" | "final-candidate" | "finalcandidate" => "final_candidate",
+        "candidate" | "poc" | "positive" | "positive-poc" => "candidate",
+        "diagnostic" | "source-only" | "needs-poc" | "generated-not-verified" => "diagnostic",
+        "negative-control" | "negative" | "control" => "negative_control",
+        "scan-unknown" | "scan" => "scan_unknown",
+        _ => return None,
+    };
+    Some(normalized.to_string())
+}
+
+/// 解析 observed_exit；接受 `1`、`exit=1`、`rc=1` 这类写法。
+fn parse_observed_exit(value: &str) -> Option<i64> {
+    let cleaned = clean_bundle_value(value);
+    let mut token = String::new();
+    for ch in cleaned.chars() {
+        if ch.is_ascii_digit() {
+            token.push(ch);
+        } else if ch == '-' && token.is_empty() {
+            token.push('-');
+        } else if token.is_empty() {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if token.is_empty() || token == "-" {
+        return None;
+    }
+    token.parse::<i64>().ok()
+}
+
+/// 与 runner 的 verified 判定保持一致。
+fn is_verified_verification(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "verified" | "vulnerable_runtime_confirmed" | "differential_verified"
+    )
+}
+
+/// 解析候选文件：优先 `file=`，缺失时从 replay 的 /tmp/poc 挂载反推。
+fn bundle_file_from_detail(detail: &str, replay: &str) -> String {
+    let declared = detail_field(detail, "file");
+    if !declared.is_empty() {
+        return declared;
+    }
+    poc_file_from_replay(replay).unwrap_or_default()
+}
+
+/// 读取 detail 里 `key=value` 形式的一行（与 poc_bundle 的解析口径一致）。
+fn detail_field(detail: &str, key: &str) -> String {
+    let prefix = format!("{key}=");
+    detail
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| clean_bundle_value(value))
+        .unwrap_or_default()
 }

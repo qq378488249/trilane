@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 include!("runbook_types.inc.rs");
 include!("runbook_lifecycle.inc.rs");
 include!("runbook_findings.inc.rs");

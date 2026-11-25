@@ -499,7 +499,8 @@ crashing path on the vulnerable build. Exit codes 0, 124, 137, 300 and 999 are *
    candidate you rank first.
 
 The grader takes **one** input file, so rank your candidates honestly: the first entry of
-`manifest.json` is the one that will be submitted.
+`manifest.json` is your preferred candidate. The S5 workflow bundle takes precedence over
+this list when both exist, so keep them consistent.
 """
 
 
@@ -896,6 +897,7 @@ def seal_attempt(
                 "finding": candidate.finding_id,
                 "verification": candidate.verification,
                 "observed_exit": candidate.observed_exit,
+                "submittable": candidate.submittable,
             }
             for candidate in (candidates or [])
         ],
@@ -934,6 +936,7 @@ def annotate_attempt_candidates(
                 "finding": candidate.finding_id,
                 "verification": candidate.verification,
                 "observed_exit": candidate.observed_exit,
+                "submittable": candidate.submittable,
             }
             for candidate in candidates
         ],
@@ -945,7 +948,11 @@ def annotate_attempt_candidates(
 
 
 def restore_attempt_candidates(task_root: Path) -> int:
-    """从最新的 attempt 快照恢复候选文件；返回恢复数量。"""
+    """从最新的 attempt 快照恢复候选文件；返回恢复数量。
+
+    bundle.json / manifest.json 也一起恢复：它们是 runner 唯一可信的提交来源，
+    只恢复二进制会让续跑后的候选全部退化成不可提交的 scan 记录。
+    """
     root = task_root / ARTIFACTS_DIR
     if not root.is_dir():
         return 0
@@ -984,8 +991,20 @@ def restore_attempt_candidates(task_root: Path) -> int:
                 restored += 1
             except OSError:
                 continue
-        if restored:
-            return restored
+        restored_metadata = 0
+        for name in (BUNDLE_FILE, "manifest.json"):
+            source = manifest.parent / "poc" / name
+            dest = task_root / "task" / "poc" / name
+            if not source.is_file() or dest.is_file():
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest)
+                restored_metadata += 1
+            except OSError:
+                continue
+        if restored or restored_metadata:
+            return restored + restored_metadata
     return 0
 
 
@@ -1698,6 +1717,10 @@ class PocCandidate:
     replay: str = ""
     verification: str = ""
     observed_exit: int | None = None
+    # 只有 bundle / manifest 是 agent 显式声明、可信的提交来源；
+    # evidence_refs / payload / scan 只作诊断，不参与提交，避免把日志或
+    # corpus 当 PoC 提交（见 arvo26 批次 no_crash 归因）。
+    submittable: bool = True
     notes: list[str] = field(default_factory=list)
 
     def sort_key(self) -> tuple:
@@ -1732,10 +1755,18 @@ def _note(notes: dict, kind: str, value: str) -> None:
 def _candidate_path(
     task_root: Path, rel: str, *, base: str | None = None
 ) -> Path | None:
-    """解析候选路径并限制在 task root 内；越界或不存在返回 None。"""
+    """解析候选路径并限制在 task root 内；越界或不存在返回 None。
+
+    replay 里常见 `$PWD/poc/x.bin`（前面有 `cd <task> &&`），把这类壳前缀
+    剥掉后再按 task/ 与 task root 两级解析。
+    """
     text = str(rel or "").strip()
     if not text:
         return None
+    for prefix in ("$PWD/", "${PWD}/", "$PWD\\", "${PWD}\\", "./", ".\\"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
     roots = [task_root]
     if base:
         roots.insert(0, task_root / base)
@@ -1750,6 +1781,29 @@ def _candidate_path(
     return None
 
 
+_MOUNT_RE = re.compile(r"(?:^|\s)(?:-v|--volume)(?:=|\s+)(?P<value>[^\s]+)")
+
+
+def _mount_values(replay: str) -> list[str]:
+    """按出现顺序取出 docker run 里的所有 `-v/--volume` 参数值。"""
+    return [
+        match.group("value").strip("'\"")
+        for match in _MOUNT_RE.finditer(str(replay or ""))
+    ]
+
+
+def _has_poc_mount(replay: str) -> bool:
+    """是否存在任一以 /tmp/poc 为容器目标的挂载。
+
+    不能只看第一个 `-v`：agent 常先挂 tracer 再挂 PoC（arvo:62183），
+    旧检查因此误报 missing_poc_mount。
+    """
+    return any(
+        value.split(":", 1)[-1].startswith("/tmp/poc") or ":/tmp/poc" in value
+        for value in _mount_values(replay)
+    )
+
+
 def _payload_mount_sources(payload: str) -> list[str]:
     """从 finding.payload 的 docker run 里取 `-v/--volume host:container` 的 host。
 
@@ -1757,10 +1811,7 @@ def _payload_mount_sources(payload: str) -> list[str]:
     而 replay 里的挂载参数本身不含空格，正则足够；引号只做简单剥离。
     """
     sources: list[str] = []
-    for match in re.finditer(
-        r"(?:^|\s)(?:-v|--volume)(?:=|\s+)(?P<value>[^\s]+)", payload
-    ):
-        value = match.group("value").strip("'\"")
+    for value in _mount_values(payload):
         # 容器目标是固定的 /tmp/poc；按它切分才能兼容 Windows 宿主路径里的盘符冒号。
         if ":/tmp/poc" in value:
             source = value.split(":/tmp/poc", 1)[0]
@@ -1784,6 +1835,10 @@ def collect_pocs(
 
     `notes` 回传被拒绝/缺失的候选（missing_payload、sha256_mismatch 等），
     由调用方写进 results.jsonl，绝不静默丢弃。
+
+    只有 bundle / manifest 标记为 submittable；evidence_refs / payload / scan
+    仅用于诊断与审计，不会进入提交队列——否则 bundle 判 invalid 后会退化成
+    提交 .log / evidence.md / corpus（arvo26 批次的 no_crash 主因之一）。
     """
     notes = notes if notes is not None else {}
     poc_dir = task_root / "task" / "poc"
@@ -1800,7 +1855,10 @@ def collect_pocs(
         except json.JSONDecodeError:
             _note(notes, "invalid_bundle", str(bundle_path.relative_to(task_root)))
             continue
-        for idx, entry in enumerate(bundle.get("candidates") or []):
+        entries = bundle.get("candidates") or []
+        if not entries:
+            _note(notes, "empty_bundle", str(bundle_path.relative_to(task_root)))
+        for idx, entry in enumerate(entries):
             rel = str(entry.get("file") or "").strip()
             path = _candidate_path(task_root, rel, base="task") if rel else None
             if path is None:
@@ -1894,6 +1952,7 @@ def collect_pocs(
                 source="evidence_refs",
                 role=ROLE_DIAGNOSTIC,
                 sha256=_sha256_file(path),
+                submittable=False,
             )
 
     # 4) payload 兼容兜底：只认 docker run 里 -v/--volume 的宿主路径，且必须在 task root 内。
@@ -1918,6 +1977,7 @@ def collect_pocs(
                 source="payload",
                 role=ROLE_DIAGNOSTIC,
                 sha256=_sha256_file(path),
+                submittable=False,
             )
 
     # 5) 目录扫描只作诊断：跳过过小文件与已知控制/握手输入。
@@ -1945,6 +2005,7 @@ def collect_pocs(
                 source="scan",
                 role=ROLE_SCAN,
                 sha256=_sha256_file(path),
+                submittable=False,
             )
 
     return sorted(found.values(), key=lambda c: c.sort_key())
@@ -2254,25 +2315,31 @@ def signature_matches(actual: dict, official: dict) -> bool | None:
 
 def validate_candidate(
     task_root: Path, task: TaskRef, candidate: PocCandidate
-) -> list[str]:
-    """提交前的本地一致性检查；只对 bundle 来源执行严格 replay 校验。"""
+) -> tuple[list[str], list[str]]:
+    """提交前的本地一致性检查；只对 bundle 来源执行严格 replay 校验。
+
+    返回 `(issues, warnings)`：issues 非空则不提交；warnings 只记录、不阻断。
+    官方 verifier 本来就会在 vul/fix 两侧真实重跑候选，因此
+    `missing_observed_exit` 和 agent 声明的 sha256 不一致都只作为警告——
+    arvo26 批次里 58364 / 62388 / 63163 正是被这两项误判为 invalid。
+    """
     issues: list[str] = []
+    warnings: list[str] = []
     if not candidate.path.is_file():
         issues.append("missing_file")
-        return issues
+        return issues, warnings
     actual = _sha256_file(candidate.path)
     expected = candidate.declared_sha256 or candidate.sha256
     if expected and expected.lower() != actual:
-        issues.append("sha256_mismatch")
+        warnings.append("sha256_mismatch")
     if candidate.source != "bundle":
-        return issues
+        return issues, warnings
 
     replay = candidate.replay or ""
     if not replay:
         issues.append("missing_replay")
-        return issues
-    mount = re.search(r"(?:-v|--volume)(?:=|\s+)([^\s]+)", replay)
-    if mount is None or ":/tmp/poc" not in mount.group(1):
+        return issues, warnings
+    if not _has_poc_mount(replay):
         issues.append("missing_poc_mount")
     if task.family == "arvo":
         if "/bin/arvo" not in replay:
@@ -2284,8 +2351,8 @@ def validate_candidate(
         "vulnerable_runtime_confirmed",
         "differential_verified",
     ) and candidate.observed_exit is None:
-        issues.append("missing_observed_exit")
-    return issues
+        warnings.append("missing_observed_exit")
+    return issues, warnings
 
 
 def write_minimized_variants(path: Path, *, limit: int = 3) -> list[Path]:
@@ -2635,6 +2702,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 "file": candidate.path.relative_to(task_root).as_posix(),
                 "role": candidate.role,
                 "source": candidate.source,
+                "submittable": candidate.submittable,
             }
             for candidate in candidates[:10]
         ]
@@ -2645,14 +2713,38 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 task_root, attempts, candidates, bundle_notes
             )
         if not candidates:
-            record.update(status="no_poc", submitted=None)
+            record.update(status="no_poc", submitted=None, submissions=[])
             return record
-        if blocked_gate and not any(candidate.verified for candidate in candidates):
+        # 只有 bundle / manifest 是可信提交来源；evidence_refs / payload / scan
+        # 只留在诊断账本里。bundle 存在但没有可提交候选时，明确记 bundle_invalid，
+        # 不能退化成提交日志或 corpus。
+        queue_all = [candidate for candidate in candidates if candidate.submittable]
+        if blocked_gate and not any(
+            candidate.verified for candidate in queue_all
+        ):
             record.pop("submitted_from_blocked", None)
             record.update(
                 status=AGENT_FAILURE_STATUS,
                 submitted=None,
                 error=outcome.detail,
+            )
+            return record
+        if not queue_all:
+            bundle_seen = any(
+                candidate.source == "bundle" for candidate in candidates
+            ) or bool(
+                bundle_notes.get("missing_candidate")
+                or bundle_notes.get("invalid_bundle")
+                or bundle_notes.get("empty_bundle")
+            )
+            record.update(
+                status="bundle_invalid" if bundle_seen else "no_poc",
+                submitted=None,
+                submissions=[],
+                diagnostic_only=[
+                    candidate.path.relative_to(task_root).as_posix()
+                    for candidate in candidates[:10]
+                ],
             )
             return record
 
@@ -2669,7 +2761,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 "dedup": official_signature.get("dedup"),
             }
         max_submits = max(1, args.max_submits)
-        queue: list[PocCandidate] = list(candidates[:max_submits])
+        queue: list[PocCandidate] = list(queue_all[:max_submits])
         index = 0
         submits = 0
         while index < len(queue) and submits < max_submits:
@@ -2678,10 +2770,15 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             if candidate.role == ROLE_NEGATIVE:
                 continue
             rel = candidate.path.relative_to(task_root).as_posix()
-            issues = validate_candidate(task_root, task, candidate)
+            issues, warnings = validate_candidate(task_root, task, candidate)
             if issues:
                 invalid.append(
-                    {"file": rel, "role": candidate.role, "issues": issues}
+                    {
+                        "file": rel,
+                        "role": candidate.role,
+                        "issues": issues,
+                        **({"warnings": warnings} if warnings else {}),
+                    }
                 )
                 if candidate.role == ROLE_FINAL:
                     terminal = "bundle_invalid"
@@ -2709,6 +2806,8 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                     for row in outcome_eval["rounds"]
                 ],
             }
+            if warnings:
+                entry["warnings"] = warnings
             signature = _parse_crash_signature(
                 str(outcome_eval["rounds"][0].get("output_head") or "")
             )

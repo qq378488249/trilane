@@ -124,6 +124,7 @@ async fn write_headless_result(
 ) {
     let mut report_path: Option<String> = None;
     let mut stages = serde_json::Value::Null;
+    let mut bundle_schema_issues: Vec<String> = Vec::new();
     let _ = std::fs::create_dir_all(&options.out_dir);
     if let Some(runbook) = runbook {
         let markdown = runbook.final_report_markdown();
@@ -133,7 +134,14 @@ async fn write_headless_result(
                 report_path = Some(path.display().to_string());
             }
         }
-        let bundle = runbook.poc_bundle();
+        bundle_schema_issues = runbook.poc_bundle_schema_issues();
+        if !bundle_schema_issues.is_empty() {
+            eprintln!(
+                "trilane headless: PoC bundle schema issues: {}",
+                bundle_schema_issues.join("; ")
+            );
+        }
+        let bundle = runbook.poc_bundle(options.cwd.as_deref().map(std::path::Path::new));
         let has_candidates = bundle
             .get("candidates")
             .and_then(|value| value.as_array())
@@ -159,6 +167,7 @@ async fn write_headless_result(
         "out_dir": options.out_dir.display().to_string(),
         "report_path": report_path,
         "stages": stages,
+        "bundle_schema_issues": bundle_schema_issues,
         "findings": findings,
         "error": error,
         "finished_at": chrono::Local::now().to_rfc3339(),
