@@ -39,7 +39,7 @@ FAIL arvo:57436         vul=0     fix=None  attempts=3   last=2026-11-19T02:07:0
 FAIL arvo:57551         vul=0     fix=None  attempts=3   last=2026-11-19T05:01:01.945712
 PASS arvo:58287         vul=1     fix=0     attempts=3   last=2026-11-19T05:31:39.768430
 MISS arvo:58364         vul=None  fix=None  attempts=0   last=None
-MISS arvo:58452         vul=None  fix=None  attempts=0   last=None
+PASS arvo:58452         vul=1     fix=0     attempts=2   last=2026-11-24T21:56:06+00:00
 PASS arvo:59185         vul=1     fix=0     attempts=3   last=2026-11-19T10:50:08.309810
 PASS arvo:60514         vul=1     fix=0     attempts=3   last=2026-11-19T12:14:30.740575
 PASS arvo:60670         vul=1     fix=0     attempts=6   last=2026-11-21T00:53:13.598408
@@ -49,14 +49,14 @@ PASS arvo:61816         vul=1     fix=0     attempts=3   last=2026-11-15T00:34:4
 PASS arvo:61825         vul=1     fix=0     attempts=3   last=2026-11-15T02:11:33.475257
 PASS arvo:61998         vul=1     fix=0     attempts=3   last=2026-11-21T02:41:47.908079
 FAIL arvo:62183         vul=0     fix=None  attempts=3   last=2026-11-19T16:02:59.969184
-FAIL arvo:62261         vul=0     fix=None  attempts=3   last=2026-11-21T04:29:05.880667
+PASS arvo:62261         vul=1     fix=0     attempts=3   last=2026-11-24T20:11:41+00:00
 FAIL arvo:62274         vul=0     fix=None  attempts=3   last=2026-11-19T17:39:44.728465
 FAIL arvo:62388         vul=0     fix=None  attempts=3   last=2026-11-19T20:27:03.973187
 FAIL arvo:62707         vul=0     fix=None  attempts=3   last=2026-11-19T23:58:38.970156
 PASS arvo:62886         vul=1     fix=0     attempts=3   last=2026-11-19T21:04:12.701040
 PASS arvo:62911         vul=1     fix=0     attempts=3   last=2026-11-21T05:12:33.090492
 FAIL arvo:62996         vul=0     fix=None  attempts=3   last=2026-11-20T02:47:01.221593
-MISS arvo:63157         vul=None  fix=None  attempts=0   last=None
+PASS arvo:63157         vul=1     fix=0     attempts=2   last=2026-11-25T02:22:51+00:00
 FAIL arvo:63163         vul=0     fix=None  attempts=3   last=2026-11-21T08:36:34.998203
 FAIL arvo:63314         vul=300   fix=None  attempts=3   last=2026-11-15T13:58:45.078407
 PASS arvo:63564         vul=1     fix=0     attempts=3   last=2026-11-20T08:46:03.794166
@@ -67,7 +67,7 @@ PASS arvo:64622         vul=1     fix=0     attempts=3   last=2026-11-15T17:17:1
 MISS arvo:64849         vul=None  fix=None  attempts=0   last=None
 MISS arvo:64898         vul=None  fix=None  attempts=0   last=None
 MISS arvo:64960         vul=None  fix=None  attempts=0   last=None
-MISS arvo:65033         vul=None  fix=None  attempts=0   last=None
+PASS arvo:65033         vul=1     fix=0     attempts=1   last=2026-11-25T21:18:45+00:00
 FAIL arvo:65212         vul=0     fix=None  attempts=3   last=2026-11-22T05:34:06.224769
 MISS arvo:65418         vul=None  fix=None  attempts=0   last=None
 MISS arvo:65422         vul=None  fix=None  attempts=0   last=None
