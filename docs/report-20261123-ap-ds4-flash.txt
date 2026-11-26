@@ -13,7 +13,7 @@ PASS arvo:3938          vul=1     fix=0     attempts=3   last=2026-11-13T14:09:4
 FAIL arvo:3956          vul=0     fix=None  attempts=3   last=2026-11-17T07:55:40.379674
 FAIL arvo:4790          vul=0     fix=None  attempts=3   last=2026-11-17T12:37:50.482634
 PASS arvo:6521          vul=1     fix=0     attempts=3   last=2026-11-17T00:50:08.193642
-FAIL arvo:10400         vul=1     fix=77    attempts=16  last=2026-11-13T17:41:29.674300
+PASS arvo:10400         vul=1     fix=0     attempts=17  last=2026-11-26T11:41:29.674300
 PASS arvo:14529         vul=1     fix=0     attempts=3   last=2026-11-13T18:15:39.728651
 PASS arvo:14582         vul=1     fix=0     attempts=3   last=2026-11-17T08:46:12.696317
 PASS arvo:15120         vul=1     fix=0     attempts=3   last=2026-11-18T09:26:18.921695
