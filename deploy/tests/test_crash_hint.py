@@ -302,6 +302,24 @@ class PrepareTaskPackageTest(unittest.TestCase):
         cb.prepare_task_package(self.task, self.task_root, crash_hint=mode)
         return (self.task_root / "task" / "TASK.md").read_text(encoding="utf-8")
 
+    def _prepare_seed(self, mode: str) -> str:
+        cb.prepare_task_package(
+            self.task, self.task_root, crash_hint="off", seed_corpus=mode
+        )
+        return (self.task_root / "task" / "TASK.md").read_text(encoding="utf-8")
+
+    def test_seed_corpus_on_includes_extraction(self) -> None:
+        text = self._prepare_seed("on")
+        self.assertIn("## Seed corpus", text)
+        self.assertIn("/out/<fuzzer>_seed_corpus.zip", text)
+        self.assertNotIn("{task_dir}", text)
+        self.assertNotIn("{masked_id}", text)
+
+    def test_seed_corpus_off_excludes_extraction(self) -> None:
+        text = self._prepare_seed("off")
+        self.assertNotIn("## Seed corpus", text)
+        self.assertIn("permitted task material under strict level 1", text)
+
     def test_off_matches_baseline(self) -> None:
         text = self._prepare("off")
         self.assertNotIn("Official crash report hint", text)

@@ -127,6 +127,10 @@ cp /opt/cybergym/mask_map.json /opt/
 > 参考 poc。脚本只把 level1 两件放进任务包，其余一律不拷，`_assert_level1_package` 会
 > fail-closed。`error.txt` 只会被控制器读取，按 `--crash-hint` 派生入口文件/方法写进
 > 提示词；原文永不落盘。不用手工删。
+>
+> 动态分析模式（`SEED_CORPUS=on`，默认）会在起智能体前从 vul 镜像的 `/out` 复制
+> `*_seed_corpus.zip` 到 `task/seeds/`，不复制预构建 fuzz 二进制；设 `SEED_CORPUS=off`
+> 可回到严格 level 1。
 
 验证镜像：
 
@@ -344,6 +348,7 @@ POC_ARCHIVE_MAX_MB=50                 # attempt 快照最多复制多少 MB（0 
 POC_SCAN_MAX_FILES=500                # 诊断扫描最多读取多少个文件（0 = 不限）
 POC_SCAN_MAX_MB=20                    # 诊断扫描最多读取多少 MB（0 = 不限）
 CRASH_HINT=entry                      # 见 §7：entry / full / off
+SEED_CORPUS=on                        # on=允许使用 /out 下的种子语料（动态分析）；off=严格 level 1
 ```
 
 先干跑（只做 preflight + 准备任务包，不启动智能体）：

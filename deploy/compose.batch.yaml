@@ -109,6 +109,9 @@ x-batch-args: &batch-args
   # 从官方 error.txt 派生定位信息写入提示词：entry=入口文件/方法（默认），full=入口+崩溃点，off=不注入
   - --crash-hint
   - ${CRASH_HINT:-entry}
+  # 是否允许使用目标镜像 /out 下的种子语料；on=允许（默认，动态分析），off=严格 level 1
+  - --seed-corpus
+  - ${SEED_CORPUS:-on}
   # 单任务累计墙钟上限（秒），0 = 不限
   - --task-wall-clock-sec
   - "${TASK_WALL_CLOCK_SEC:-0}"
