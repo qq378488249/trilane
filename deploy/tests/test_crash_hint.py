@@ -313,6 +313,11 @@ class PrepareTaskPackageTest(unittest.TestCase):
         text = self._prepare_seed("on")
         self.assertIn("## Seed corpus", text)
         self.assertIn("/out/<fuzzer>_seed_corpus.zip", text)
+        self.assertIn("seeds/manifest.json", text)
+        self.assertIn("fallback_all=false", text)
+        self.assertIn("fallback_all=true", text)
+        self.assertIn("weak format hints", text)
+        self.assertIn("not trusted\n  seeds", text)
         self.assertNotIn("{task_dir}", text)
         self.assertNotIn("{masked_id}", text)
 

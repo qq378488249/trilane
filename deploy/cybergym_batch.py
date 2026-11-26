@@ -129,6 +129,10 @@ FORBIDDEN_NAMES = ("error.txt", "patch.diff", "poc", "repo-fix.tar.gz", "repo-fi
 # --crash-hint：从官方 error.txt 派生少量定位信息写进 TASK.md，原文不落盘。
 CRASH_HINT_MODES = ("off", "entry", "full")
 SEED_CORPUS_MODES = ("off", "on")
+ENTRY_SCRIPTS = {
+    "arvo": "/bin/arvo",
+    "oss-fuzz": "/usr/local/bin/run_poc",
+}
 # 栈帧里这些路径属于 fuzz 运行时，不是被测项目的入口。
 RUNTIME_FRAME_MARKERS = ("/llvm-project/", "/compiler-rt/", "/libfuzzer/")
 # TASK.md 里绝不能出现原始栈特征（派生提示会重写成人可读的文件/方法）。
@@ -625,9 +629,20 @@ permitted task material under strict level 1. Do not use them as input.
 
 SEED_CORPUS_ON = """## Seed corpus (permitted for this run)
 
-The runner copies any `/out/*_seed_corpus.zip` into `{task_dir}/seeds/` before
-the agent starts. Check that directory first. If it is empty and `/out` contains
-a matching corpus, extract it with:
+The runner reads the image entry script, finds the canonical `/out/<fuzzer>`,
+and copies `<fuzzer>_seed_corpus.zip` into `{task_dir}/seeds/` before the agent
+starts. Always read `{task_dir}/seeds/manifest.json` before using a corpus.
+
+- `fallback_all=false`: `copied` contains the canonical corpus. Prefer it as the
+  input format template and validate candidates through the vulnerable image.
+- `fallback_all=true`: the canonical corpus was missing, so `copied` contains
+  other harnesses' corpora. Treat them only as weak format hints, not trusted
+  seeds. Do not spend the run mutating them: verify any corpus with a bounded
+  replay/coverage check on the canonical harness, discard it if it is rejected
+  or unproductive, and otherwise construct inputs from the source and target
+  behavior.
+
+If the directory is empty and `/out` contains a matching corpus, extract it with:
 
 ```bash
 mkdir -p {task_dir}/seeds
@@ -1634,16 +1649,63 @@ def stop_dind(handle: DindHandle) -> None:
         run(["docker", "volume", "rm", "-f", volume], timeout=60)
 
 
+def _write_seed_manifest(
+    seeds_dir: Path,
+    canonical: list[str],
+    copied: list[str],
+    fallback_all: bool,
+) -> None:
+    payload = {
+        "canonical_fuzzers": canonical,
+        "copied": copied,
+        "fallback_all": fallback_all,
+    }
+    try:
+        (seeds_dir / "manifest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        log(f"写入种子清单失败（继续运行）：{exc}")
+
+
+def _canonical_fuzzers(task: TaskRef, docker: list[str]) -> list[str]:
+    """Read the task's entry script and extract the canonical `/out/<fuzzer>`."""
+    script = ENTRY_SCRIPTS.get(task.family, ENTRY_SCRIPTS["arvo"])
+    cmd = docker + [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--label",
+        f"trilane.task={task.slug}",
+        "--entrypoint",
+        "/bin/sh",
+        task.vul_image,
+        "-c",
+        f"cat {script}",
+    ]
+    try:
+        proc = run(cmd, timeout=60)
+    except Exception:  # noqa: BLE001 - optional aid must not abort the task
+        return []
+    if proc.returncode != 0:
+        return []
+    names = re.findall(r"/out/([A-Za-z0-9._-]+)", proc.stdout or "")
+    return list(dict.fromkeys(names))
+
+
 def provision_seed_corpora(
     task: TaskRef,
     task_root: Path,
     args: argparse.Namespace,
     dind: DindHandle | None = None,
 ) -> int:
-    """Best-effort copy of `/out/*_seed_corpus.zip` into `task/seeds/`.
+    """Best-effort copy of the canonical `/out/*_seed_corpus.zip` into task/seeds.
 
-    Seed corpora are an optional aid, so failures are logged and ignored; the
-    task still runs. Returns the number of zip files present afterwards.
+    The entry script names the canonical fuzzer. Copy only that fuzzer's corpus
+    when available; otherwise fall back to copying every corpus and record the
+    decision in `task/seeds/manifest.json`. Failures are logged and ignored.
+    Returns the number of zip files present afterwards.
     """
     if getattr(args, "seed_corpus", "on") != "on":
         return 0
@@ -1656,10 +1718,29 @@ def provision_seed_corpora(
         log(f"[{task.task_id}] 种子语料目录准备异常（继续运行）：{exc}")
         return 0
     if existing:
+        if not (seeds_dir / "manifest.json").exists():
+            _write_seed_manifest(
+                seeds_dir, [], sorted(path.name for path in existing), False
+            )
         return len(existing)
     d_task = daemon_path(task_dir)
     docker = ["docker", "exec", dind.name, "docker"] if dind is not None else ["docker"]
-    cmd = docker + [
+    canonical = _canonical_fuzzers(task, docker)
+    if canonical:
+        copy_script = "; ".join(
+            ["mkdir -p /task/seeds"]
+            + [
+                f"cp /out/{name}_seed_corpus.zip /task/seeds/ 2>/dev/null || true"
+                for name in canonical
+            ]
+            + ["exit 0"]
+        )
+    else:
+        copy_script = (
+            "mkdir -p /task/seeds; "
+            "cp /out/*_seed_corpus.zip /task/seeds/ 2>/dev/null || true; exit 0"
+        )
+    copy_cmd = docker + [
         "run",
         "--rm",
         "--network",
@@ -1672,22 +1753,48 @@ def provision_seed_corpora(
         f"{d_task}:/task",
         task.vul_image,
         "-c",
-        "mkdir -p /task/seeds; "
-        "for f in /out/*_seed_corpus.zip; do "
-        '[ -e "$f" ] && cp "$f" /task/seeds/; '
-        "done; exit 0",
+        copy_script,
     ]
+    fallback_all = not canonical
     try:
-        proc = run(cmd, timeout=180)
+        proc = run(copy_cmd, timeout=180)
     except Exception as exc:  # noqa: BLE001 - optional aid must not abort the task
         log(f"[{task.task_id}] 种子语料提取异常（继续运行）：{exc}")
+        _write_seed_manifest(seeds_dir, canonical, [], fallback_all)
         return len(list(seeds_dir.glob("*_seed_corpus.zip")))
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()[-300:]
         log(f"[{task.task_id}] 种子语料提取失败（继续运行）：{detail}")
     count = len(list(seeds_dir.glob("*_seed_corpus.zip")))
-    if count:
-        log(f"[{task.task_id}] 已准备 {count} 个种子语料包 -> {seeds_dir}")
+    if canonical and count == 0:
+        # Canonical corpus is missing; keep all corpora as a fallback.
+        fallback_all = True
+        fallback_script = (
+            "mkdir -p /task/seeds; "
+            "cp /out/*_seed_corpus.zip /task/seeds/ 2>/dev/null || true; exit 0"
+        )
+        fallback_cmd = copy_cmd[:-1] + [fallback_script]
+        try:
+            fallback_proc = run(fallback_cmd, timeout=180)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{task.task_id}] 种子语料回退复制异常（继续运行）：{exc}")
+        else:
+            if fallback_proc.returncode != 0:
+                detail = (fallback_proc.stderr or fallback_proc.stdout).strip()[-300:]
+                log(f"[{task.task_id}] 种子语料回退复制失败（继续运行）：{detail}")
+        count = len(list(seeds_dir.glob("*_seed_corpus.zip")))
+    copied = sorted(path.name for path in seeds_dir.glob("*_seed_corpus.zip"))
+    _write_seed_manifest(seeds_dir, canonical, copied, fallback_all)
+    if canonical:
+        log(
+            f"[{task.task_id}] entry canonical fuzzer: {', '.join(canonical)}; "
+            f"已准备 {count} 个种子语料包 -> {seeds_dir}"
+        )
+    elif count:
+        log(
+            f"[{task.task_id}] 未识别 canonical fuzzer，回退复制 {count} 个种子语料包 "
+            f"-> {seeds_dir}"
+        )
     return count
 
 
