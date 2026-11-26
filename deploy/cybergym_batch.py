@@ -3171,6 +3171,26 @@ def consensus(rounds: list[dict]) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def _blocked_gate_candidates(
+    task_root: Path, outcome: RunOutcome
+) -> list[PocCandidate]:
+    """blocked gate 的尝试里是否已经有 verified 的可提交候选。
+
+    workflow gate 判 error 不代表这题解不出：只要 S5 已经把 PoC 打进 bundle，
+    就应该先交给官方 verifier 决定，而不是无条件续跑再赌一轮——续跑的 S5 可能
+    拿到空 bundle，把已验证的清单覆盖掉。谓词与 run_one 里 blocked_gate 分支
+    保持一致（submittable 且 verified），避免"提前停又在这里被判失败"。
+    """
+    if outcome.status != "error" or not _is_blocked_gate(outcome.detail):
+        return []
+    notes: dict = {}
+    return [
+        candidate
+        for candidate in collect_pocs(task_root, outcome.result, notes)
+        if candidate.submittable and candidate.verified
+    ]
+
+
 def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_root: Path) -> dict:
     task_root = out_root / task.slug
     record: dict = {
@@ -3248,6 +3268,18 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             if outcome.status == "timeout" and args.resume != "off":
                 retryable = True
             if not retryable:
+                break
+
+            # gate 判 error 但已经复现出 verified 候选：先提交，别再烧一轮。
+            # 续跑不是免费的——它会把 S5 打包结果重写一遍，历史上有把
+            # verified 候选换成空 file 清单的情况（arvo:64898）。
+            promising = _blocked_gate_candidates(task_root, outcome)
+            if promising:
+                log(
+                    f"[{task.task_id}] {outcome.status} 但已有 {len(promising)} 个 "
+                    f"verified 候选（{promising[0].path.relative_to(task_root).as_posix()}），"
+                    "先提交不再续跑"
+                )
                 break
 
             point = find_resume_point(task_root, outcome.result) if args.resume != "off" else None

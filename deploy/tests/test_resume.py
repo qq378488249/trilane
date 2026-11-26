@@ -583,6 +583,40 @@ class RunOneRetryTests(unittest.TestCase):
         )
         self.assertFalse(calls["directive"].startswith("TRILANE_RESUME_RUN%"))
 
+    def test_blocked_gate_candidate_is_submitted_without_retry(self):
+        """gate 判 error 但已有 verified 候选：先提交，不再续跑覆盖 bundle。"""
+        calls = {"n": 0}
+        detail = (
+            "TRILANE reached S5 after a weak S4. S4 must emit per-claim "
+            "PROBE%, CONTROL%, VERIFY%, REJECTED%, or S4_SKIP% evidence."
+        )
+
+        def fake(task, task_root, args):
+            calls["n"] += 1
+            _write_verified_bundle(task_root)
+            return cb.RunOutcome(
+                "error",
+                0,
+                60.0,
+                {
+                    "status": "error",
+                    "error": detail,
+                    "findings": [{"id": "VULN-001"}],
+                },
+                detail,
+            )
+
+        client = _RecordingClient()
+        record = self._run(
+            self._args(resume="timeout", agent_retries=3), fake, client
+        )
+
+        self.assertEqual(calls["n"], 1, "不应继续续跑")
+        self.assertEqual(record["agent_attempts"], 1)
+        self.assertTrue(record["submitted_from_blocked"])
+        self.assertEqual(record["status"], "wrong_target")
+        self.assertEqual([p.name for p in client.pocs], ["good.bin"])
+
     def test_retry_that_drops_bundle_falls_back_to_prior_attempt(self):
         """续跑把已验证清单覆盖成空行时，回退到上一次 attempt 的快照。"""
         calls = {"n": 0}
