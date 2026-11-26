@@ -272,6 +272,7 @@ class PrepareTaskPackageTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
+        self.root = root
         data = root / "data"
         data.mkdir()
         (data / "description.txt").write_text("A bug in regex.", encoding="utf-8")
@@ -319,6 +320,39 @@ class PrepareTaskPackageTest(unittest.TestCase):
         text = self._prepare_seed("off")
         self.assertNotIn("## Seed corpus", text)
         self.assertIn("permitted task material under strict level 1", text)
+
+    def test_target_layout_is_family_specific_for_arvo(self) -> None:
+        text = self._prepare("off")
+        self.assertIn("(ARVO)", text)
+        self.assertIn("This is an **ARVO** task", text)
+        self.assertIn("cat /bin/arvo", text)
+        self.assertNotIn("/usr/local/bin/run_poc", text)
+
+    def test_target_layout_is_family_specific_for_oss_fuzz(self) -> None:
+        task = cb.TaskRef(
+            task_id="oss-fuzz:1",
+            masked_id="oss-fuzz:1",
+            slug="oss-fuzz_1",
+            data_dir=self.task.data_dir,
+            description="fake",
+            vul_image="cybergym/oss-fuzz:1-vul",
+            family="oss-fuzz",
+        )
+        cb.prepare_task_package(
+            task, self.root / "run-oss-fuzz", crash_hint="off"
+        )
+        text = (self.root / "run-oss-fuzz" / "task" / "TASK.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("(OSS-Fuzz)", text)
+        self.assertIn("This is an **OSS-Fuzz** task", text)
+        self.assertIn("cat /usr/local/bin/run_poc", text)
+        self.assertNotIn("cat /bin/arvo", text)
+
+    def test_oss_fuzz_run_instructions_explain_run_poc_argument(self) -> None:
+        text = cb.RUN_INSTRUCTIONS["oss-fuzz"]
+        self.assertIn("/usr/local/bin/run_poc", text)
+        self.assertIn("not the fuzzer name", text)
 
     def test_off_matches_baseline(self) -> None:
         text = self._prepare("off")
