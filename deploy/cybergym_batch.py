@@ -89,6 +89,23 @@ CONTROL_HINTS = (
 BUNDLE_FILE = "bundle.json"
 ARTIFACTS_DIR = "artifacts"
 
+# attempt 快照最多复制多少 PoC 文件 / 字节。agent 跑 fuzz 时可能在 task/poc
+# 留下几万个小文件，逐个 copy2 到 9p 挂载上会把 worker 卡住，导致结果迟迟
+# 不写进 results.jsonl。0 表示不限制；bundle.json / manifest.json 始终复制。
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+POC_ARCHIVE_MAX_FILES = _env_int("POC_ARCHIVE_MAX_FILES", 200)
+POC_ARCHIVE_MAX_MB = _env_int("POC_ARCHIVE_MAX_MB", 50)
+# 诊断用的目录扫描同样要限流：agent 的 fuzz 语料可能有十万级文件，
+# 逐个 stat + sha256 会拖住结果落账；bundle/manifest 候选不受此限制。
+POC_SCAN_MAX_FILES = _env_int("POC_SCAN_MAX_FILES", 500)
+POC_SCAN_MAX_MB = _env_int("POC_SCAN_MAX_MB", 20)
+
 ROLE_FINAL = "final_candidate"
 ROLE_CANDIDATE = "candidate"
 ROLE_DIAGNOSTIC = "diagnostic"
@@ -831,19 +848,75 @@ def _latest_attempt_dir(task_root: Path, attempt: int) -> Path | None:
     return matches[0] if matches else None
 
 
-def _copy_poc_tree(task_root: Path, dest: Path) -> None:
+def _copy_poc_tree(
+    task_root: Path,
+    dest: Path,
+    *,
+    max_files: int | None = None,
+    max_bytes: int | None = None,
+) -> dict[str, int | bool]:
+    """把 task/poc 快照到 dest/poc，按文件数和总字节数设上限。
+
+    上限只影响审计快照；原 task/poc 不动，候选文件仍可按需恢复。bundle.json /
+    manifest.json 是续跑可信来源，始终优先复制且不受上限影响。返回复制统计，
+    由 seal_attempt 写进 attempt.json，避免“为什么少了文件”无从查起。
+    """
+    if max_files is None:
+        max_files = POC_ARCHIVE_MAX_FILES
+    if max_bytes is None:
+        max_bytes = POC_ARCHIVE_MAX_MB * 1024 * 1024
+    summary: dict[str, int | bool] = {
+        "files_total": 0,
+        "files_copied": 0,
+        "bytes_copied": 0,
+        "files_skipped": 0,
+        "limit_hit": False,
+        "max_files": max_files,
+        "max_bytes": max_bytes,
+    }
     poc_dir = task_root / "task" / "poc"
     if not poc_dir.is_dir():
-        return
-    for source in poc_dir.rglob("*"):
-        if not source.is_file():
+        return summary
+
+    files = [path for path in poc_dir.rglob("*") if path.is_file()]
+    summary["files_total"] = len(files)
+    metadata = {BUNDLE_FILE, "manifest.json"}
+    data_copied = 0
+
+    def priority(path: Path) -> tuple[int, int, str]:
+        rel = path.relative_to(poc_dir)
+        return (
+            0 if rel.as_posix() in metadata else 1,
+            len(rel.parts),
+            rel.as_posix(),
+        )
+
+    for source in sorted(files, key=priority):
+        rel = source.relative_to(poc_dir)
+        is_metadata = rel.as_posix() in metadata
+        try:
+            size = source.stat().st_size
+        except OSError:
             continue
-        target = dest / "poc" / source.relative_to(poc_dir)
+        if not is_metadata and (
+            (max_files and data_copied >= max_files)
+            or (max_bytes and int(summary["bytes_copied"]) + size > max_bytes)
+        ):
+            summary["files_skipped"] = int(summary["files_skipped"]) + 1
+            summary["limit_hit"] = True
+            continue
+        target = dest / "poc" / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(source, target)
         except OSError:
+            summary["files_skipped"] = int(summary["files_skipped"]) + 1
             continue
+        summary["files_copied"] = int(summary["files_copied"]) + 1
+        summary["bytes_copied"] = int(summary["bytes_copied"]) + size
+        if not is_metadata:
+            data_copied += 1
+    return summary
 
 
 def seal_attempt(
@@ -854,6 +927,7 @@ def seal_attempt(
     result: dict | None = None,
     candidates: list[PocCandidate] | None = None,
     notes: dict | None = None,
+    record: dict | None = None,
 ) -> Path:
     """把本次 attempt 的产物快照到 artifacts/attempt-N，供续跑恢复与事后审计。"""
     dest = _attempt_dir(task_root, attempt)
@@ -865,7 +939,15 @@ def seal_attempt(
                 shutil.copy2(source, dest / name)
             except OSError:
                 continue
-    _copy_poc_tree(task_root, dest)
+    copy_summary = _copy_poc_tree(task_root, dest)
+    if record is not None:
+        record["poc_copy"] = copy_summary
+    if copy_summary["limit_hit"]:
+        log(
+            f"[{task_root.name}] poc 快照达到上限：复制 "
+            f"{copy_summary['files_copied']}/{copy_summary['files_total']} 个文件，"
+            f"跳过 {copy_summary['files_skipped']} 个（原 task/poc 未动）"
+        )
 
     source_status = (result or {}).get("status")
     if source_status is None:
@@ -902,6 +984,7 @@ def seal_attempt(
             for candidate in (candidates or [])
         ],
         "notes": notes or {},
+        "poc_copy": copy_summary,
     }
     (dest / "attempt.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1792,16 +1875,134 @@ def _mount_values(replay: str) -> list[str]:
     ]
 
 
-def _has_poc_mount(replay: str) -> bool:
-    """是否存在任一以 /tmp/poc 为容器目标的挂载。
+def _mount_source_target(value: str) -> tuple[str, str]:
+    """拆 `-v` 值里的源和目标；兼容 Windows 盘符 `D:/x:/tmp/poc:ro`。"""
+    text = value.strip().strip("'\"")
+    parts = text.rsplit(":", 2)
+    if len(parts) >= 3:
+        return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return text, text
 
-    不能只看第一个 `-v`：agent 常先挂 tracer 再挂 PoC（arvo:62183），
-    旧检查因此误报 missing_poc_mount。
-    """
+
+def _has_poc_mount(replay: str) -> bool:
+    """是否存在以 /tmp/poc 为容器目标的显式挂载。"""
     return any(
-        value.split(":", 1)[-1].startswith("/tmp/poc") or ":/tmp/poc" in value
+        _mount_source_target(value)[1].startswith("/tmp/poc")
         for value in _mount_values(replay)
     )
+
+
+def _replay_token_matches_candidate(
+    token: str, candidate: PocCandidate, task_root: Path
+) -> bool:
+    """replay 里的某个输入路径是否指向当前候选文件（而不是别的文件）。"""
+    text = str(token or "").strip().strip("'\"")
+    if not text:
+        return False
+    if text.startswith("file://"):
+        text = text[7:]
+    norm = text.replace("\\", "/").rstrip("/")
+    if norm.rsplit("/", 1)[-1] == candidate.path.name:
+        return True
+    try:
+        rel = candidate.path.relative_to(task_root).as_posix()
+        poc_rel = candidate.path.relative_to(task_root / "task" / "poc").as_posix()
+    except ValueError:
+        return False
+    return (
+        norm == rel
+        or norm.endswith("/" + rel)
+        or norm == poc_rel
+        or norm.endswith("/" + poc_rel)
+        # 挂载整个 task/poc 目录时，候选一定在其中。
+        or norm == "task/poc"
+        or norm.endswith("/task/poc")
+        or norm == "poc"
+        or norm.endswith("/poc")
+    )
+
+
+def _replay_cat_sources(replay: str) -> list[str]:
+    """抽取 `cat <file>` 的源路径；跳过 `cat > file` 这种重定向。"""
+    return [
+        match.group(1).strip("'\"")
+        for match in re.finditer(
+            r"(?:^|[|&;\s])cat\s+(?!>)([^\s|&;<>]+)", str(replay or "")
+        )
+    ]
+
+
+def _replay_redirect_sources(replay: str) -> list[str]:
+    """抽取 `< <file>` 的输入重定向。"""
+    return [
+        match.group(1).strip("'\"")
+        for match in re.finditer(r"(?:^|\s)<\s*([^\s|&;<>]+)", str(replay or ""))
+    ]
+
+
+def _replay_is_interactive(replay: str) -> bool:
+    return bool(re.search(r"(?:^|\s)(?:-i|--interactive)(?=\s|=|$)", replay))
+
+
+def _replay_writes_poc(replay: str) -> bool:
+    return "/tmp/poc" in replay or bool(re.search(r">\s*\S*poc\b", replay))
+
+
+def _replay_references_arvo(replay: str) -> bool:
+    return "/bin/arvo" in replay or bool(re.search(r"\barvo(?:_replay)?\b", replay))
+
+
+def _classify_replay(
+    replay: str, candidate: PocCandidate, task_root: Path
+) -> str:
+    """判断 replay 的输入方式是否可接受。
+
+    返回值：
+      poc_mount / indirect_mount / stdin：可接受，交给官方 verifier；
+      no_input：有 docker run，但没有输入路径；
+      invalid_replay：不是可执行的 docker 命令（典型是自然语言）；
+      replay_input_mismatch：命令里出现的是别的文件，不是当前候选；
+      unknown：有输入路径但形态未识别，按候选验证等级降级处理。
+    """
+    text = str(replay or "")
+    if not re.search(r"\bdocker\s+run\b", text):
+        return "invalid_replay"
+
+    mounts = _mount_values(text)
+    if any(_mount_source_target(value)[1].startswith("/tmp/poc") for value in mounts):
+        return "poc_mount"
+
+    # 间接挂载：-v file:/tmp/in 后再 cp /tmp/in /tmp/poc
+    if mounts and re.search(r"\bcp\b[^\n;|&]*\s/tmp/poc\b", text):
+        if any(
+            _replay_token_matches_candidate(
+                _mount_source_target(value)[0], candidate, task_root
+            )
+            for value in mounts
+        ):
+            return "indirect_mount"
+        return "replay_input_mismatch"
+
+    # stdin：docker run -i + cat/< 文件 + 写入 /tmp/poc 或 /work/poc + 调 arvo
+    sources = _replay_cat_sources(text) + _replay_redirect_sources(text)
+    if (
+        _replay_is_interactive(text)
+        and sources
+        and _replay_writes_poc(text)
+        and _replay_references_arvo(text)
+    ):
+        if any(
+            _replay_token_matches_candidate(source, candidate, task_root)
+            for source in sources
+        ):
+            return "stdin"
+        return "replay_input_mismatch"
+
+    if mounts or sources:
+        return "unknown"
+    return "no_input"
 
 
 def _payload_mount_sources(payload: str) -> list[str]:
@@ -1981,14 +2182,25 @@ def collect_pocs(
             )
 
     # 5) 目录扫描只作诊断：跳过过小文件与已知控制/握手输入。
+    #    十万级 fuzz 语料逐个 sha256 会拖住结果落账，因此按文件数/字节数限流；
+    #    bundle / manifest 候选在上面已经处理，不受扫描上限影响。
+    scan_files = 0
+    scan_bytes = 0
+    scan_skipped = 0
+    scan_limit_hit = False
     for directory in (poc_dir, out_dir):
         if not directory.is_dir():
             continue
-        for path in directory.rglob("*"):
-            if not path.is_file() or path in found:
-                continue
-            if path.suffix in SCAN_SKIP_SUFFIXES or path.name in SCAN_SKIP_NAMES:
-                continue
+        paths = [
+            path
+            for path in directory.rglob("*")
+            if path.is_file()
+            and path not in found
+            and path.suffix not in SCAN_SKIP_SUFFIXES
+            and path.name not in SCAN_SKIP_NAMES
+        ]
+        paths.sort(key=lambda path: (len(path.relative_to(directory).parts), str(path)))
+        for path in paths:
             try:
                 size = path.stat().st_size
             except OSError:
@@ -2000,6 +2212,13 @@ def collect_pocs(
             if any(hint in path.name.lower() for hint in CONTROL_HINTS):
                 _note(notes, "scan_control_skipped", rel)
                 continue
+            if (POC_SCAN_MAX_FILES and scan_files >= POC_SCAN_MAX_FILES) or (
+                POC_SCAN_MAX_MB
+                and scan_bytes + size > POC_SCAN_MAX_MB * 1024 * 1024
+            ):
+                scan_skipped += 1
+                scan_limit_hit = True
+                continue
             found[path] = PocCandidate(
                 path=path,
                 source="scan",
@@ -2007,6 +2226,18 @@ def collect_pocs(
                 sha256=_sha256_file(path),
                 submittable=False,
             )
+            scan_files += 1
+            scan_bytes += size
+    if scan_limit_hit:
+        log(
+            f"[{task_root.name}] 诊断扫描达到上限：扫描 {scan_files} 个，"
+            f"跳过 {scan_skipped} 个"
+        )
+        _note(
+            notes,
+            "scan_limit_hit",
+            f"scanned={scan_files} skipped={scan_skipped}",
+        )
 
     return sorted(found.values(), key=lambda c: c.sort_key())
 
@@ -2360,8 +2591,25 @@ def validate_candidate(
     if not replay:
         issues.append("missing_replay")
         return issues, warnings
-    if not _has_poc_mount(replay):
+    replay_kind = _classify_replay(replay, candidate, task_root)
+    if replay_kind == "invalid_replay":
+        issues.append("invalid_replay")
+    elif replay_kind == "replay_input_mismatch":
+        issues.append("replay_input_mismatch")
+    elif replay_kind == "no_input":
         issues.append("missing_poc_mount")
+    elif replay_kind == "unknown":
+        # 有输入但形态未识别：本地已复现或 agent 标了 verified 时放行，
+        # 让官方 verifier 决定；纯推测的候选仍然拦住。
+        promising = candidate.verification in (
+            "verified",
+            "vulnerable_runtime_confirmed",
+            "differential_verified",
+        ) or candidate.observed_exit not in (None, 0)
+        if promising:
+            warnings.append("missing_poc_mount")
+        else:
+            issues.append("missing_poc_mount")
     if task.family == "arvo":
         if "/bin/arvo" not in replay:
             issues.append("missing_bin_arvo")
@@ -2625,7 +2873,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         outcome = run_agent(task, task_root, args)
         artifacts = record.setdefault("artifacts", [])
         artifacts.append(
-            seal_attempt(task_root, 1, task=task, result=outcome.result)
+            seal_attempt(task_root, 1, task=task, result=outcome.result, record=record)
             .relative_to(task_root)
             .as_posix()
         )
@@ -2683,7 +2931,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             outcome = run_agent(task, task_root, args)
             artifacts.append(
                 seal_attempt(
-                    task_root, attempts, task=task, result=outcome.result
+                    task_root, attempts, task=task, result=outcome.result, record=record
                 )
                 .relative_to(task_root)
                 .as_posix()

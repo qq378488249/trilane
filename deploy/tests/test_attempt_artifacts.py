@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -58,12 +59,69 @@ class AttemptArtifactTests(unittest.TestCase):
         (self.task_root / "out" / "result.json").write_text(
             json.dumps({"status": "completed"}), encoding="utf-8"
         )
-        dest = cb.seal_attempt(self.task_root, 1, task=self.task)
+        record: dict = {}
+        dest = cb.seal_attempt(self.task_root, 1, task=self.task, record=record)
         self.assertTrue((dest / "poc" / "x.bin").is_file())
         self.assertTrue((dest / "result.json").is_file())
         payload = json.loads((dest / "attempt.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["task_id"], "arvo:3938")
         self.assertEqual(payload["source_status"], "completed")
+        self.assertEqual(record["poc_copy"]["files_copied"], 1)
+        self.assertFalse(record["poc_copy"]["limit_hit"])
+
+    def test_seal_caps_poc_copy_by_file_count(self):
+        poc_dir = self.task_root / "task" / "poc"
+        for index in range(5):
+            (poc_dir / f"f{index}.bin").write_bytes(b"x" * 16)
+
+        with mock.patch.object(cb, "POC_ARCHIVE_MAX_FILES", 2), mock.patch.object(
+            cb, "POC_ARCHIVE_MAX_MB", 200
+        ):
+            dest = cb.seal_attempt(self.task_root, 1, task=self.task)
+
+        copied = [path for path in (dest / "poc").rglob("*") if path.is_file()]
+        self.assertEqual(len(copied), 2)
+        payload = json.loads((dest / "attempt.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["poc_copy"]["files_total"], 5)
+        self.assertEqual(payload["poc_copy"]["files_copied"], 2)
+        self.assertEqual(payload["poc_copy"]["files_skipped"], 3)
+        self.assertTrue(payload["poc_copy"]["limit_hit"])
+
+    def test_seal_keeps_metadata_when_file_limit_hit(self):
+        poc_dir = self.task_root / "task" / "poc"
+        (poc_dir / "bundle.json").write_text("{}", encoding="utf-8")
+        (poc_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        for index in range(3):
+            (poc_dir / f"f{index}.bin").write_bytes(b"x" * 16)
+
+        with mock.patch.object(cb, "POC_ARCHIVE_MAX_FILES", 1), mock.patch.object(
+            cb, "POC_ARCHIVE_MAX_MB", 200
+        ):
+            dest = cb.seal_attempt(self.task_root, 1, task=self.task)
+
+        self.assertTrue((dest / "poc" / "bundle.json").is_file())
+        self.assertTrue((dest / "poc" / "manifest.json").is_file())
+        self.assertEqual(
+            len([path for path in (dest / "poc").rglob("*") if path.is_file()]), 3
+        )
+
+    def test_seal_caps_poc_copy_by_bytes(self):
+        poc_dir = self.task_root / "task" / "poc"
+        (poc_dir / "a.bin").write_bytes(b"a" * 100)
+        (poc_dir / "b.bin").write_bytes(b"b" * 100)
+
+        with mock.patch.object(cb, "POC_ARCHIVE_MAX_FILES", 100), mock.patch.object(
+            cb, "POC_ARCHIVE_MAX_MB", 0
+        ):
+            # 直接调用底层函数，避免把 MB 截断成 0 后走“不限制”分支。
+            summary = cb._copy_poc_tree(
+                self.task_root, self.task_root / "artifacts" / "attempt-bytes",
+                max_files=100, max_bytes=150,
+            )
+
+        self.assertEqual(summary["files_copied"], 1)
+        self.assertEqual(summary["files_skipped"], 1)
+        self.assertTrue(summary["limit_hit"])
 
     def test_second_seal_does_not_overwrite(self):
         first = cb.seal_attempt(self.task_root, 1, task=self.task)
