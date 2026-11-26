@@ -58,6 +58,20 @@ class CollectPocsTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_scan_limit_caps_diagnostic_hash_work(self):
+        for index in range(5):
+            write_file(self.poc_dir / f"scan{index}.bin", b"S" * 32)
+
+        with mock.patch.object(cb, "POC_SCAN_MAX_FILES", 2), mock.patch.object(
+            cb, "POC_SCAN_MAX_MB", 50
+        ):
+            notes: dict = {}
+            candidates = cb.collect_pocs(self.task_root, {}, notes)
+
+        scans = [candidate for candidate in candidates if candidate.source == "scan"]
+        self.assertEqual(len(scans), 2)
+        self.assertIn("scan_limit_hit", notes)
+
     def test_bundle_declares_final_role_and_sha(self):
         poc = write_file(self.poc_dir / "poc_a", b"A" * 64)
         digest = cb._sha256_file(poc)
@@ -820,6 +834,119 @@ class CrashSignatureTests(unittest.TestCase):
         )
         self.assertEqual(issues, [])
         self.assertEqual(warnings, [])
+
+    def test_validate_accepts_indirect_tmp_in_cp(self):
+        """arvo:62261：文件挂到 /tmp/in，再 cp 到 /tmp/poc，不能误判。"""
+        task = cb.TaskRef(
+            "arvo:62261", "m", "arvo_62261", Path("data"), "d", "img", "arvo"
+        )
+        poc = write_file(
+            self.task_root / "task" / "poc" / "vuln-001.bin", b"V" * 64
+        )
+        replay = (
+            "docker run --rm --label trilane.task=431baaa1d310 "
+            "-v /host/task/poc/vuln-001.bin:/tmp/in:ro --network none "
+            "n132/arvo:62261-vul /bin/sh -c "
+            "'cp /tmp/in /tmp/poc && /bin/arvo'"
+        )
+        candidate = self._candidate(
+            path=poc, sha256=cb._sha256_file(poc), replay=replay
+        )
+        self.assertEqual(
+            cb._classify_replay(replay, candidate, self.task_root),
+            "indirect_mount",
+        )
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(warnings, [])
+
+    def test_validate_accepts_interactive_stdin_replay(self):
+        """arvo:66679：docker run -i + cat 候选，经 stdin 写入 /work/poc。"""
+        task = cb.TaskRef(
+            "arvo:66679", "m", "arvo_66679", Path("data"), "d", "img", "arvo"
+        )
+        poc = write_file(
+            self.task_root / "task" / "poc" / "cand_uaf_min.bin", b"U" * 64
+        )
+        replay = (
+            "cat poc/cand_uaf_min.bin | docker run --rm "
+            "--label trilane.task=30b6823e6c24 -i --network none "
+            "n132/arvo:66679-vul /bin/sh -c "
+            "'sed \"s#/tmp/poc#/work/poc#g\" /bin/arvo > /work/arvo_replay; "
+            "chmod +x /work/arvo_replay; cat > /work/poc; /work/arvo_replay'"
+        )
+        candidate = self._candidate(
+            path=poc, sha256=cb._sha256_file(poc), replay=replay
+        )
+        self.assertEqual(
+            cb._classify_replay(replay, candidate, self.task_root), "stdin"
+        )
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(warnings, [])
+
+    def test_validate_rejects_natural_language_replay(self):
+        """arvo:62183：replay 写成自然语言，不能放行。"""
+        task = cb.TaskRef(
+            "arvo:62183", "m", "arvo_62183", Path("data"), "d", "img", "arvo"
+        )
+        poc = write_file(
+            self.task_root / "task" / "poc" / "s5_final_eqx.bin", b"S" * 64
+        )
+        replay = (
+            "mount poc/s5_final_eqx.bin at /tmp/poc:ro; "
+            "run /bin/arvo in n132/arvo:62183-vul with --network none"
+        )
+        candidate = self._candidate(
+            path=poc, sha256=cb._sha256_file(poc), replay=replay
+        )
+        self.assertEqual(
+            cb._classify_replay(replay, candidate, self.task_root),
+            "invalid_replay",
+        )
+        issues, _ = cb.validate_candidate(self.task_root, task, candidate)
+        self.assertIn("invalid_replay", issues)
+
+    def test_validate_rejects_replay_for_other_file(self):
+        """replay 里出现别的文件名时，不能因为形态像就放行。"""
+        task = cb.TaskRef(
+            "arvo:62261", "m", "arvo_62261", Path("data"), "d", "img", "arvo"
+        )
+        poc = write_file(
+            self.task_root / "task" / "poc" / "good.bin", b"G" * 64
+        )
+        replay = (
+            "docker run --rm -v /host/task/poc/other.bin:/tmp/in:ro "
+            "--network none n132/arvo:62261-vul /bin/sh -c "
+            "'cp /tmp/in /tmp/poc && /bin/arvo'"
+        )
+        candidate = self._candidate(
+            path=poc, sha256=cb._sha256_file(poc), replay=replay
+        )
+        self.assertEqual(
+            cb._classify_replay(replay, candidate, self.task_root),
+            "replay_input_mismatch",
+        )
+        issues, _ = cb.validate_candidate(self.task_root, task, candidate)
+        self.assertIn("replay_input_mismatch", issues)
+
+    def test_validate_unknown_replay_falls_back_to_verification(self):
+        """形态未识别但本地已复现时，只记 warning，交给官方 verifier。"""
+        task = cb.TaskRef(
+            "arvo:3938", "m", "arvo_3938", Path("data"), "d", "img", "arvo"
+        )
+        candidate = self._candidate(
+            replay="docker run -v /host/task/poc/p.bin:/mnt:ro img /bin/arvo"
+        )
+        issues, warnings = cb.validate_candidate(
+            self.task_root, task, candidate
+        )
+        self.assertEqual(issues, [])
+        self.assertIn("missing_poc_mount", warnings)
 
     def test_validate_oss_fuzz_rejects_bin_arvo(self):
         task = cb.TaskRef(

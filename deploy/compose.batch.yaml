@@ -51,6 +51,12 @@ x-batch-common: &batch-common
     TZ: ${TZ:-Asia/Shanghai}
     # 仅用于日志：镜像盘检查对应的宿主机目录（日志里展示宿主路径）
     DIND_DOCKER_ROOT_HOST: ${DIND_DOCKER_ROOT:-}
+    # attempt 快照最多复制多少 PoC 文件 / MB；0 = 不限制。bundle.json / manifest.json 始终复制。
+    POC_ARCHIVE_MAX_FILES: ${POC_ARCHIVE_MAX_FILES:-200}
+    POC_ARCHIVE_MAX_MB: ${POC_ARCHIVE_MAX_MB:-50}
+    # 诊断用的目录扫描上限；bundle / manifest 候选不受影响。
+    POC_SCAN_MAX_FILES: ${POC_SCAN_MAX_FILES:-500}
+    POC_SCAN_MAX_MB: ${POC_SCAN_MAX_MB:-20}
     CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
     CYBERGYM_SERVER: ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
     CYBERGYM_API_KEY: ${CYBERGYM_API_KEY:?CYBERGYM_API_KEY is required in .env}
@@ -83,6 +89,9 @@ x-batch-args: &batch-args
   # 旧变量名 DIND_DISK_CHECK 仍兼容。
   - --disk-check
   - "${DISK_CHECK:-${DIND_DISK_CHECK:-1}}"
+  # 工作盘最低剩余空间（GB）；默认 8，当前空间紧张时可用 MIN_FREE_GB 调低
+  - --min-free-gb
+  - "${MIN_FREE_GB:-1}"
   # docker 数据所在盘（宿主机路径），挂进容器的固定路径 /docker-root
   - --dind-docker-root
   - "${DIND_DOCKER_ROOT:+/docker-root}"
