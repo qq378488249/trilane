@@ -251,6 +251,65 @@ class ArchiveTests(unittest.TestCase):
         cb.archive_attempt_outputs(self.root, 2)  # 不应抛异常
 
 
+class _RecordingClient:
+    """假 verifier：只记录提交的 PoC，固定判 wrong_target。"""
+
+    def __init__(self):
+        self.pocs: list[Path] = []
+
+    def evaluate(self, *, masked_id, real_task_id, poc, rounds):
+        self.pocs.append(Path(poc))
+        return {
+            "judgement": "wrong_target",
+            "tally": {"wrong_target": 1},
+            "rounds": [
+                {
+                    "poc_id": f"p{len(self.pocs)}",
+                    "vul_exit_code": 1,
+                    "fix_exit_code": 1,
+                    "output_head": "",
+                }
+            ],
+        }
+
+
+def _write_verified_bundle(task_root: Path) -> Path:
+    """写一份"已复现"的 bundle 与候选文件，replay 是合法的 /tmp/poc 挂载。"""
+    poc_dir = task_root / "task" / "poc"
+    poc_dir.mkdir(parents=True, exist_ok=True)
+    poc = poc_dir / "good.bin"
+    poc.write_bytes(b"G" * 64)
+    (poc_dir / "bundle.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "file": "task/poc/good.bin",
+                        "role": "candidate",
+                        "verification": "verified",
+                        "finding": "VULN-001",
+                        "replay": (
+                            f"docker run --rm --network none -v {poc}:/tmp/poc:ro "
+                            "n132/arvo:3938-vul /bin/arvo"
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return poc
+
+
+def _seed_stage_dirs(task_root: Path) -> None:
+    run_dir = task_root / "state" / "trilane" / "runs" / "trilane-20261115-161706"
+    for stage in ("stage0", "stage1", "stage2"):
+        d = run_dir / stage
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "runbook.json").write_text(_snapshot(), encoding="utf-8")
+        (d / "status.json").write_text(json.dumps({"status": "Running"}), encoding="utf-8")
+
+
 class RunOneRetryTests(unittest.TestCase):
     """run_one 的重试决策：模拟 run_agent，不启动容器。"""
 
@@ -333,9 +392,11 @@ class RunOneRetryTests(unittest.TestCase):
 
         return fake
 
-    def _run(self, args, fake):
+    def _run(self, args, fake, client=None):
         with mock.patch.object(cb, "run_agent", fake):
-            return cb.run_one(self.task, args, client=object(), out_root=self.work_root)
+            return cb.run_one(
+                self.task, args, client=client or object(), out_root=self.work_root
+            )
 
     def test_timeout_resumes_from_stage(self):
         calls = {"n": 0}
@@ -521,6 +582,52 @@ class RunOneRetryTests(unittest.TestCase):
             record["resume_attempts"], [], "全新任务不应产生续跑记录"
         )
         self.assertFalse(calls["directive"].startswith("TRILANE_RESUME_RUN%"))
+
+    def test_retry_that_drops_bundle_falls_back_to_prior_attempt(self):
+        """续跑把已验证清单覆盖成空行时，回退到上一次 attempt 的快照。"""
+        calls = {"n": 0}
+
+        def fake(task, task_root, args):
+            calls["n"] += 1
+            out = task_root / "out"
+            out.mkdir(parents=True, exist_ok=True)
+            if calls["n"] == 1:
+                _write_verified_bundle(task_root)
+                _seed_stage_dirs(task_root)
+                (out / "result.json").write_text(
+                    json.dumps({"status": "error"}), encoding="utf-8"
+                )
+                return cb.RunOutcome(
+                    "container_failed", 1, 60.0, {"status": "error"}, "容器挂了"
+                )
+            poc_dir = task_root / "task" / "poc"
+            (poc_dir / "bundle.json").write_text(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {"file": "", "verification": "generated-not-verified"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (poc_dir / "good.bin").unlink()
+            (out / "result.json").write_text(
+                json.dumps({"status": "completed", "findings": []}), encoding="utf-8"
+            )
+            return cb.RunOutcome(
+                "completed", 0, 60.0, {"status": "completed", "findings": []}, ""
+            )
+
+        client = _RecordingClient()
+        record = self._run(
+            self._args(resume="timeout", agent_retries=3), fake, client
+        )
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(record["fallback_bundle"], "attempt-1")
+        self.assertEqual(record["status"], "wrong_target")
+        self.assertEqual([p.name for p in client.pocs], ["good.bin"])
 
 
 if __name__ == "__main__":

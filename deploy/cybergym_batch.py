@@ -1214,6 +1214,73 @@ def restore_attempt_candidates(task_root: Path) -> int:
     return 0
 
 
+def _merge_notes(target: dict, extra: dict) -> None:
+    """把第二次 collect_pocs 的 notes 并入已有 notes，不丢审计记录。"""
+    for key, values in extra.items():
+        bucket = target.setdefault(key, [])
+        for value in values:
+            if value not in bucket:
+                bucket.append(value)
+
+
+def _bundle_has_file_entries(path: Path) -> bool:
+    """bundle 里是否至少有一个非空 file 的候选。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(
+        str(entry.get("file") or "").strip()
+        for entry in payload.get("candidates") or []
+    )
+
+
+def restore_prior_bundle(task_root: Path, attempt: int) -> str | None:
+    """本次 attempt 没有可提交候选时，回退到更早 attempt 的 bundle 快照。
+
+    续跑的 S5 可能拿到空 bundle，把上一轮写好的候选清单覆盖成一堆 `file=`
+    为空的行。候选文件本身还在 task/poc（或 task/scratch）里，丢的只是清单；
+    这里把快照的 bundle 和缺失的 poc 文件补回去，让 collect_pocs 重新解析。
+
+    `attempt` 是本次 run 的总尝试数，只会回退到它之前的快照；返回使用的
+    attempt 目录名，没有可用快照时返回 None。
+    """
+    for index in range(attempt - 1, 0, -1):
+        snapshot = _latest_attempt_dir(task_root, index)
+        if snapshot is None:
+            continue
+        bundle = snapshot / "poc" / BUNDLE_FILE
+        if not bundle.is_file() or not _bundle_has_file_entries(bundle):
+            continue
+        poc_dir = task_root / "task" / "poc"
+        poc_dir.mkdir(parents=True, exist_ok=True)
+        restored = 0
+        # 只补缺失文件，不覆盖续跑自己写的产物；scratch 里的候选从来不在
+        # 快照里，但它在 task 目录下，路径仍然有效。
+        for source in (snapshot / "poc").rglob("*"):
+            if not source.is_file():
+                continue
+            target = poc_dir / source.relative_to(snapshot / "poc")
+            if target.is_file():
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                restored += 1
+            except OSError:
+                continue
+        try:
+            shutil.copy2(bundle, poc_dir / BUNDLE_FILE)
+        except OSError:
+            continue
+        log(
+            f"[{task_root.name}] 本次 attempt 没有可提交候选，回退到 "
+            f"attempt-{index} 的 bundle（补回 {restored} 个 poc 文件）"
+        )
+        return f"attempt-{index}"
+    return None
+
+
 def reset_poc_for_run(task_root: Path) -> Path | None:
     """把进入本次 run 前的 poc/ 整体挪到 artifacts/orphan-poc-*，然后清空。
 
@@ -3258,6 +3325,15 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
 
         bundle_notes: dict = {}
         candidates = collect_pocs(task_root, outcome.result, bundle_notes)
+        if not any(candidate.submittable for candidate in candidates):
+            # 本次 attempt 交不出可提交候选，但更早的 attempt 可能交得出：
+            # 文件都还在，只是续跑的 S5 把清单覆盖了。回退后重新解析。
+            fallback = restore_prior_bundle(task_root, attempts)
+            if fallback is not None:
+                record["fallback_bundle"] = fallback
+                fallback_notes: dict = {}
+                candidates = collect_pocs(task_root, outcome.result, fallback_notes)
+                _merge_notes(bundle_notes, fallback_notes)
         record["poc_candidates"] = [
             {
                 "file": candidate.path.relative_to(task_root).as_posix(),

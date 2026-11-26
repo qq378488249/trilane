@@ -177,6 +177,62 @@ class AttemptArtifactTests(unittest.TestCase):
         self.assertFalse((self.task_root / "out" / "bundle.json").exists())
         self.assertTrue((self.task_root / "out" / "bundle.json.attempt1").is_file())
 
+    def _seal_verified_bundle(self) -> Path:
+        poc_dir = self.task_root / "task" / "poc"
+        poc = poc_dir / "good.bin"
+        poc.write_bytes(b"G" * 64)
+        (poc_dir / "bundle.json").write_text(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "file": "task/poc/good.bin",
+                            "role": "candidate",
+                            "verification": "verified",
+                            "finding": "VULN-001",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return cb.seal_attempt(self.task_root, 1, task=self.task)
+
+    def test_restore_prior_bundle_recovers_overwritten_bundle(self):
+        self._seal_verified_bundle()
+        poc_dir = self.task_root / "task" / "poc"
+        # 续跑把已验证的清单覆盖成 file 为空的行，候选文件也丢了。
+        (poc_dir / "bundle.json").write_text(
+            json.dumps(
+                {"candidates": [{"file": "", "verification": "generated-not-verified"}]}
+            ),
+            encoding="utf-8",
+        )
+        (poc_dir / "good.bin").unlink()
+
+        used = cb.restore_prior_bundle(self.task_root, 2)
+
+        self.assertEqual(used, "attempt-1")
+        self.assertEqual((poc_dir / "good.bin").read_bytes(), b"G" * 64)
+        payload = json.loads((poc_dir / "bundle.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["candidates"][0]["file"], "task/poc/good.bin")
+
+    def test_restore_prior_bundle_ignores_fileless_snapshot(self):
+        poc_dir = self.task_root / "task" / "poc"
+        (poc_dir / "bundle.json").write_text(
+            json.dumps({"candidates": [{"file": "", "role": "diagnostic"}]}),
+            encoding="utf-8",
+        )
+        cb.seal_attempt(self.task_root, 1, task=self.task)
+        current = (poc_dir / "bundle.json").read_text(encoding="utf-8")
+
+        self.assertIsNone(cb.restore_prior_bundle(self.task_root, 2))
+        self.assertEqual((poc_dir / "bundle.json").read_text(encoding="utf-8"), current)
+
+    def test_restore_prior_bundle_never_uses_current_attempt(self):
+        self._seal_verified_bundle()
+        self.assertIsNone(cb.restore_prior_bundle(self.task_root, 1))
+
     def test_scan_skips_archived_attempt_outputs(self):
         (self.task_root / "out" / "result.json.attempt1").write_text(
             json.dumps({"status": "error"}) + " " * 32, encoding="utf-8"
