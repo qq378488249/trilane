@@ -248,6 +248,68 @@ class CollectPocsTests(unittest.TestCase):
         self.assertTrue((self.poc_dir / cb.BUNDLE_FILE).is_file())
         self.assertTrue((self.poc_dir / "manifest.json").is_file())
 
+    def test_sort_prefers_local_crash_evidence_over_role(self):
+        write_file(self.poc_dir / "final.bin", b"F" * 64)
+        write_file(self.poc_dir / "diag.bin", b"D" * 64)
+        (self.poc_dir / cb.BUNDLE_FILE).write_text(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "file": "poc/final.bin",
+                            "role": "final_candidate",
+                            "verification": "generated-not-verified",
+                            "observed_exit": 0,
+                        },
+                        {
+                            "file": "poc/diag.bin",
+                            "role": "diagnostic",
+                            "verification": "generated-not-verified",
+                            "observed_exit": 1,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        candidates = cb.collect_pocs(self.task_root, {})
+        self.assertEqual([c.path.name for c in candidates], ["diag.bin", "final.bin"])
+
+    def test_manifest_verified_upgrades_bundle_candidate(self):
+        write_file(self.poc_dir / "shared.bin", b"S" * 64)
+        (self.poc_dir / cb.BUNDLE_FILE).write_text(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "file": "poc/shared.bin",
+                            "role": "final_candidate",
+                            "verification": "generated-not-verified",
+                            "observed_exit": 0,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.poc_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "pocs": [
+                        {
+                            "file": "poc/shared.bin",
+                            "rank": 1,
+                            "verified_on_vul": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        candidates = cb.collect_pocs(self.task_root, {})
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].verified)
+
     def test_sort_prefers_bundle_over_manifest_and_scan(self):
         write_file(self.poc_dir / "scan.bin", b"S" * 64)
         write_file(self.poc_dir / "manifest.bin", b"M" * 64)
@@ -708,7 +770,7 @@ class RunOneCandidateLoopTests(unittest.TestCase):
         self.assertEqual(record["status"], "agent_failed")
         self.assertFalse(record.get("submitted_from_blocked", False))
 
-    def test_explicit_final_candidate_no_crash_stops_early(self):
+    def test_final_candidate_no_crash_falls_back_to_next_candidate(self):
         fake = self._fake_agent(
             {
                 cb.BUNDLE_FILE: json.dumps(
@@ -735,8 +797,10 @@ class RunOneCandidateLoopTests(unittest.TestCase):
                 ),
                 self.work_root,
             )
-        self.assertEqual(record["status"], "no_crash")
-        self.assertEqual(len(record["submissions"]), 1)
+        self.assertEqual(record["status"], "solved")
+        self.assertEqual(len(record["submissions"]), 2)
+        self.assertEqual(record["fallback_after_no_crash"], ["task/poc/final.bin"])
+        self.assertEqual(record["unverified_final"], ["task/poc/final.bin"])
 
 
 class CrashSignatureTests(unittest.TestCase):

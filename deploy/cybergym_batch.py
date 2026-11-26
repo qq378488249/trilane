@@ -2078,14 +2078,22 @@ class PocCandidate:
     submittable: bool = True
     notes: list[str] = field(default_factory=list)
 
+    def has_crash_evidence(self) -> bool:
+        """本地是否已经有崩过的证据：显式 verified，或 observed_exit 非 0。"""
+        return self.verified or self.observed_exit not in (None, 0)
+
     def sort_key(self) -> tuple:
         name = self.path.name.lower()
         # 对照组/握手输入几乎必然 no_crash，提交它们只是白烧一次尝试，一律沉底。
         control = 1 if any(hint in name for hint in CONTROL_HINTS) else 0
+        # 先看本地是否真的崩过，再看 bundle 声明的角色。否则一个未验证的
+        # final_candidate 会排在已复现的 diagnostic 前面，导致提前判 no_crash。
+        evidence = 0 if self.has_crash_evidence() else 1
         # 结构化 bundle 显式声明的角色优先；扫描来源永远沉底。
         role = ROLE_RANK.get(self.role, ROLE_RANK[ROLE_SCAN])
         return (
             control,
+            evidence,
             role,
             0 if self.verified else 1,
             self.rank_hint,
@@ -2390,6 +2398,10 @@ def collect_pocs(
                 _note(notes, "missing_manifest_candidate", rel)
                 continue
             if path in found:
+                # bundle 先处理；同一文件在 manifest 里标了 verified_on_vul 时，
+                # 不能因为 bundle 的 generated-not-verified 把证据丢掉。
+                if bool(entry.get("verified_on_vul")) and not found[path].verified:
+                    found[path].verified = True
                 continue
             found[path] = PocCandidate(
                 path=path,
@@ -3307,6 +3319,13 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 "dedup": official_signature.get("dedup"),
             }
         max_submits = max(1, args.max_submits)
+        unverified_finals = [
+            candidate.path.relative_to(task_root).as_posix()
+            for candidate in queue_all
+            if candidate.role == ROLE_FINAL and not candidate.has_crash_evidence()
+        ]
+        if unverified_finals:
+            record["unverified_final"] = unverified_finals
         queue: list[PocCandidate] = list(queue_all[:max_submits])
         index = 0
         submits = 0
@@ -3400,10 +3419,16 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                         )
                         for variant in variants
                     ]
-            # 只有 bundle 显式声明的 final_candidate 在 no_crash 时可以提前收手；
-            # manifest/evidence_refs/payload/scan 都不是可信优先级，继续试后续候选。
+            # final_candidate 只是 agent 的偏好，不是“停止搜索”的信号。
+            # 它 no_crash 时继续尝试后续候选，直到 MAX_SUBMITS 用完或 solved。
             if candidate.role == ROLE_FINAL and entry["judgement"] == "no_crash":
-                break
+                remaining = queue[index:]
+                if remaining:
+                    record.setdefault("fallback_after_no_crash", []).append(rel)
+                    log(
+                        f"[{task.task_id}] final_candidate {rel} no_crash，"
+                        f"继续尝试 {len(remaining)} 个后续候选"
+                    )
 
         record["submissions"] = submissions
         if invalid:
