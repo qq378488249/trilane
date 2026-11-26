@@ -940,7 +940,9 @@ def archive_attempt_outputs(task_root: Path, attempt: int) -> None:
     读走，导致状态误判。
     """
     out_dir = task_root / "out"
-    for name in ("result.json", "report.md", "agent.log"):
+    # bundle.json 也必须隔离：续跑时它会被新一次 S5 覆盖，而已验证候选只存在
+    # 于旧 bundle 里（arvo:64898 的续跑就是这样把 verified 候选换成空清单的）。
+    for name in ("result.json", "report.md", "bundle.json", "agent.log"):
         source = out_dir / name
         if source.exists():
             try:
@@ -2480,6 +2482,7 @@ def collect_pocs(
             for path in directory.rglob("*")
             if path.is_file()
             and path not in found
+            and ".attempt" not in path.name  # 上一轮被隔离的 result/report/bundle
             and path.suffix not in SCAN_SKIP_SUFFIXES
             and path.name not in SCAN_SKIP_NAMES
         ]

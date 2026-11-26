@@ -167,6 +167,27 @@ class AttemptArtifactTests(unittest.TestCase):
         self.assertEqual(restored, 0)
         self.assertFalse(poc.exists())
 
+    def test_archive_moves_engine_bundle(self):
+        (self.task_root / "out" / "bundle.json").write_text(
+            json.dumps({"candidates": []}), encoding="utf-8"
+        )
+
+        cb.archive_attempt_outputs(self.task_root, 1)
+
+        self.assertFalse((self.task_root / "out" / "bundle.json").exists())
+        self.assertTrue((self.task_root / "out" / "bundle.json.attempt1").is_file())
+
+    def test_scan_skips_archived_attempt_outputs(self):
+        (self.task_root / "out" / "result.json.attempt1").write_text(
+            json.dumps({"status": "error"}) + " " * 32, encoding="utf-8"
+        )
+
+        candidates = cb.collect_pocs(self.task_root, {})
+
+        self.assertFalse(
+            any("result.json.attempt1" in c.path.name for c in candidates)
+        )
+
     def test_reset_poc_archives_then_clears(self):
         poc = self.task_root / "task" / "poc" / "old.bin"
         poc.write_bytes(b"O" * 64)
