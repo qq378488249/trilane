@@ -331,7 +331,49 @@ def discover_tasks(
     return tasks, missing
 
 
-def _assert_level1_package(src_dir: Path, task_dir: Path) -> None:
+def _tar_member_name(member: tarfile.TarInfo, strip: bool) -> str:
+    name = member.name
+    if strip and "/" in name:
+        return name.split("/", 1)[1]
+    return name
+
+
+def _assert_tar_level1_members(members: list[tarfile.TarInfo], strip: bool) -> None:
+    """在解包前检查归档成员，避免先写 1 万+ 小文件再全树扫描。"""
+    forbidden_source = ("repo-fix.tar.gz", "repo-fix.tgz", "patch.diff")
+    bad: list[str] = []
+    for member in members:
+        name = _tar_member_name(member, strip)
+        if not name:
+            continue
+        parts = name.split("/")
+        base = parts[-1]
+        if base in forbidden_source or (base == "error.txt" and len(parts) == 1):
+            bad.append(name)
+    if bad:
+        raise RuntimeError(f"归档里出现 fix 侧/参考材料：{bad[:5]}")
+
+
+def _source_tree_violations(src_dir: Path) -> list[str]:
+    """流式扫描源码树里的 fix 侧材料，不逐文件 stat。
+
+    旧实现用 `src_dir.rglob("*")` + `p.is_file()`，在 9p/Windows 挂载的
+    大量小文件上会触发 ENOMEM（arvo:56037 实测 11,649 个文件）。这里只遍历
+    `os.walk` 的目录项和文件名，判断文件名即可，不做 stat。
+    """
+    violations: list[str] = []
+    forbidden_source = ("repo-fix.tar.gz", "repo-fix.tgz", "patch.diff")
+    for root, _dirs, files in os.walk(src_dir):
+        parent = Path(root)
+        for name in files:
+            if name in forbidden_source or (name == "error.txt" and parent == src_dir):
+                violations.append((parent / name).relative_to(src_dir).as_posix())
+    return violations
+
+
+def _assert_level1_package(
+    src_dir: Path, task_dir: Path, *, check_tree: bool = True
+) -> None:
     """确认喂给智能体的只有 level1 材料。
 
     数据目录里 `poc` / `error.txt` / `repo-fix.tar.gz` / `patch.diff` 都是 level2/3 或
@@ -340,19 +382,17 @@ def _assert_level1_package(src_dir: Path, task_dir: Path) -> None:
 
     不按 `.diff` / `.patch` 后缀扫：上游仓库自带这类文件（例如 oss-fuzz 的
     `llvmsymbol.diff`），按后缀扫会把正常任务整批拦掉。
+
+    `check_tree=False` 供解包路径使用：归档成员已经由
+    `_assert_tar_level1_members()` 在写盘前检查过，不再对 9p 上的大源码树做第二次
+    遍历。
     """
     top_level = [p.name for p in task_dir.iterdir() if p.is_file() and p.name in FORBIDDEN_NAMES]
     if top_level:
         raise RuntimeError(f"任务目录混入 level1 之外的材料：{top_level}（{task_dir}）")
-    inside = [
-        str(p.relative_to(src_dir))
-        for p in src_dir.rglob("*")
-        if p.is_file()
-        and (
-            p.name in ("repo-fix.tar.gz", "repo-fix.tgz", "patch.diff")
-            or (p.name == "error.txt" and p.parent == src_dir)
-        )
-    ]
+    if not check_tree:
+        return
+    inside = _source_tree_violations(src_dir)
     if inside:
         raise RuntimeError(f"源码树里出现 fix 侧/参考材料：{inside[:5]}（{src_dir}）")
 
@@ -723,6 +763,7 @@ def prepare_task_package(
             members = tar.getmembers()
             tops = {m.name.split("/", 1)[0] for m in members if m.name.split("/", 1)[0]}
             strip = len(tops) == 1
+            _assert_tar_level1_members(members, strip)
             for member in members:
                 name = member.name.split("/", 1)[1] if strip and "/" in member.name else member.name
                 if not name:
@@ -733,7 +774,7 @@ def prepare_task_package(
                     tar.extract(member, src_dir, filter="data")
                 except (tarfile.FilterError, OSError) as exc:
                     log(f"  跳过压缩包成员 {member.name}: {exc}")
-        _assert_level1_package(src_dir, task_dir)
+        _assert_level1_package(src_dir, task_dir, check_tree=False)
         marker.write_text(json.dumps({"task_id": task.task_id, "at": utc_stamp()}), encoding="utf-8")
 
     # description.txt 单独留一份，方便事后核对提示词来源
@@ -3621,10 +3662,16 @@ def _map_official_path(raw: str, src_dir: Path) -> Path | None:
         candidate = base / rel
         if candidate.is_file():
             return candidate
-    matches = [p for p in src_dir.glob(f"**/{rel}") if p.is_file()]
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    # 全树回退只用于路径不完全匹配的情况；找到第二个就停，避免在大源码树上
+    # 收集全部匹配（arvo:56037 在 9p 上会大量 stat）。
+    first: Path | None = None
+    for candidate in src_dir.glob(f"**/{rel}"):
+        if not candidate.is_file():
+            continue
+        if first is not None:
+            return None
+        first = candidate
+    return first
 
 
 def _hint_frame(frame: dict, src_dir: Path) -> tuple[str, dict] | None:
