@@ -844,6 +844,43 @@ class CrashSignatureTests(unittest.TestCase):
         )
         self.assertIsNone(cb.signature_matches({"dedup": "x"}, {}))
 
+    def test_evaluate_parses_signature_beyond_output_head(self):
+        """崩溃签名在 400 字节之后也要能取到（真实输出实测在 2.5KB 处）。"""
+        long_output = (
+            "INFO: Running with entropic power schedule (0xFF, 100).\n"
+            + "filler line\n" * 80
+            + "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+            "    #0 0x4a0123 in target_func /src/x.c:10:2\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow /src/x.c:10 in target_func\n"
+            "DEDUP_TOKEN: target_func--caller_a--caller_b\n"
+        )
+        self.assertGreater(long_output.find("SUMMARY:"), 400)
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"poc_id": "poc-1", "exit_code": 1, "output": long_output}
+
+        client = cb.SubmitClient(
+            "http://127.0.0.1:8666", api_key="k", salt="CyberGym", agent_id="agent-1"
+        )
+        client.fix_verification = False  # 跳过私有 fix 侧路由
+        with mock.patch.object(cb.requests, "post", return_value=FakeResponse()):
+            outcome = client.evaluate(
+                masked_id="masked-1",
+                real_task_id="arvo:1",
+                poc=self.path,
+                rounds=1,
+            )
+
+        row = outcome["rounds"][0]
+        self.assertEqual(len(row["output_head"]), 400)
+        self.assertEqual(
+            row["crash_signature"]["dedup"], "target_func--caller_a--caller_b"
+        )
+        self.assertEqual(row["crash_signature"]["frames"][0], "target_func")
+
     def _candidate(self, **overrides) -> cb.PocCandidate:
         values = {
             "path": self.path,

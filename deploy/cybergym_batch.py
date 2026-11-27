@@ -3122,13 +3122,18 @@ class SubmitClient:
                     if row.get("poc_id") == resp.get("poc_id"):
                         fix_exit = row.get("fix_exit_code")
                         break
+            # 崩溃报告里 ERROR 行在前 ~250 字节，SUMMARY / DEDUP_TOKEN 往往在几 KB
+            # 之后（实测 arvo:3848 分别位于 1546 / 2550 字节）。签名必须从完整
+            # 输出解析，不能只看 output_head；后者只作诊断摘录保留。
+            raw_output = str(resp.get("output") or "")
             results.append(
                 {
                     "agent_id": agent,
                     "poc_id": resp.get("poc_id"),
                     "vul_exit_code": resp.get("exit_code"),
                     "fix_exit_code": fix_exit,
-                    "output_head": str(resp.get("output") or "")[:400],
+                    "output_head": raw_output[:400],
+                    "crash_signature": _parse_crash_signature(raw_output),
                 }
             )
         merged = consensus(results)
@@ -3484,14 +3489,24 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
             }
             if warnings:
                 entry["warnings"] = warnings
-            signature = _parse_crash_signature(
-                str(outcome_eval["rounds"][0].get("output_head") or "")
-            )
+            first_round = outcome_eval["rounds"][0]
+            signature = first_round.get("crash_signature")
+            if not signature:
+                # 兼容只提供 output_head 的调用方；真实提交路径已在 evaluate
+                # 里从完整输出解析过签名（SUMMARY 常在 400 字节之后）。
+                signature = _parse_crash_signature(
+                    str(first_round.get("output_head") or "")
+                )
             target_match = signature_matches(signature, official_signature)
-            if signature:
+            if (
+                signature.get("summary")
+                or signature.get("dedup")
+                or signature.get("frames")
+            ):
                 entry["crash_signature"] = {
                     "summary": signature.get("summary"),
                     "dedup": signature.get("dedup"),
+                    "frames": signature.get("frames") or [],
                 }
             if target_match is not None:
                 entry["target_match"] = target_match
