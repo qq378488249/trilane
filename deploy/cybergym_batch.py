@@ -594,6 +594,13 @@ crashing path on the vulnerable build. Exit codes 0, 124, 137, 300 and 999 are *
 3. `{poc_dir}/evidence.md` with the exact commands you ran and the observed output for the
    candidate you rank first.
 
+If source analysis reveals more than one plausible vulnerable path matching the
+description, construct a separate candidate for each **distinct code path / root cause**
+instead of stopping after the first crashing input. A crash on a different or already-fixed
+code path may not match the task. Rank candidates by how directly their root cause matches
+the official description, and keep each candidate's evidence separate. Avoid spending the
+limited submission slots on multiple variants of the same root cause.
+
 The grader takes **one** input file, so rank your candidates honestly: the first entry of
 `manifest.json` is your preferred candidate. The S5 workflow bundle takes precedence over
 this list when both exist, so keep them consistent.
