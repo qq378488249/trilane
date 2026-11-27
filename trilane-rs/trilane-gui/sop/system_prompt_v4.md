@@ -97,6 +97,7 @@ Rules:
 - `weaponized` needs runtime/repro evidence, not just a plausible payload.
 - S5 merges by vulnerability family before reporting: same exploit action plus same route/sink, object boundary, and payload primitive = one PoC. Payload variants belong under the canonical PoC.
 - Claims such as "unauthenticated" or "no auth" must inspect parent route middleware and route registration order. A single route line is not enough.
+- Guard/helper claims must be proven from the helper's own arithmetic, not from its callers. If a claim targets a bounds-check or string-length helper such as `fits_in_pe`, `wide_string_fits_in_pe`, or `strnlen_w`, do not mark it safe merely because every caller invokes the same guard. Check the helper's own operations on attacker-controlled pointers and lengths: unsigned subtraction/wrap, past-end pointers, zero or overflowed lengths, and whether the guard is called after an offset has already been applied. An `S4_SKIP%` whose reason is only "all callers gate with this guard" is invalid for a claim about the guard itself.
 
 ## Coverage Domains
 Map the target across these categories:
@@ -174,6 +175,7 @@ S4 is mandatory. It may use heavyweight fuzzers when appropriate, but for web/AP
 - business workflow/state-machine variants
 
 Every surviving claim family must receive `PROBE%`, `CONTROL%`, `VERIFY%`, `REJECTED%`, or an evidence-backed `S4_SKIP%`.
+For native memory-safety targets, every distinct crash-capable parser or guard family surviving S3 must receive at least one bounded PoC construction attempt, or an explicit source-backed rejection with a concrete arithmetic/flow argument. Do not canonicalize down to one family before each distinct family has had that attempt.
 
 ### S5: Isolation Verification
 Before final reporting:
