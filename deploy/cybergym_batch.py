@@ -1628,16 +1628,18 @@ def _scout_run(
 
 
 def _scout_seed_blobs(task_root: Path, args: argparse.Namespace) -> list[ScoutSeed]:
-    """读取 task/seeds 下的 zip；不解压到目录，只把候选字节读进内存。"""
+    """读取种子语料 zip（task/seeds/ 与 task/src/ 两处）；只把候选字节读进内存。"""
     if getattr(args, "seed_corpus", "on") != "on":
-        return []
-    seeds_dir = task_root / "task" / "seeds"
-    if not seeds_dir.is_dir():
         return []
     max_files = max(1, _scout_int(getattr(args, "scout_max_runs", 40), 40))
     max_bytes = max(1, _scout_int(getattr(args, "scout_max_candidate_mb", 2), 2)) * 1024 * 1024
     blobs: list[ScoutSeed] = []
-    for zip_path in sorted(seeds_dir.glob("*_seed_corpus.zip")):
+    zip_paths: dict[str, Path] = {}
+    for base in (task_root / "task" / "seeds", task_root / "task" / "src"):
+        if base.is_dir():
+            for zip_path in base.glob("*_seed_corpus.zip"):
+                zip_paths.setdefault(zip_path.name, zip_path)
+    for zip_path in sorted(zip_paths.values()):
         try:
             with zipfile.ZipFile(zip_path) as archive:
                 infos = sorted(
