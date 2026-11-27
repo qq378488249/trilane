@@ -59,14 +59,14 @@ x-batch-common: &batch-common
     POC_SCAN_MAX_MB: ${POC_SCAN_MAX_MB:-20}
     # pre-agent scout（宿主机 docker）
     SCOUT_MODE: ${SCOUT_MODE:-on}
-    SCOUT_TIMEOUT_SEC: ${SCOUT_TIMEOUT_SEC:-180}
+    SCOUT_TIMEOUT_SEC: ${SCOUT_TIMEOUT_SEC:-420}
     SCOUT_RUN_TIMEOUT_SEC: ${SCOUT_RUN_TIMEOUT_SEC:-10}
     SCOUT_MAX_RUNS: ${SCOUT_MAX_RUNS:-40}
-    SCOUT_MAX_OUTPUT_KB: ${SCOUT_MAX_OUTPUT_KB:-32}
-    SCOUT_LIBFUZZER_SEC: ${SCOUT_LIBFUZZER_SEC:-60}
+    SCOUT_MAX_OUTPUT_KB: ${SCOUT_MAX_OUTPUT_KB:-128}
+    SCOUT_LIBFUZZER_SEC: ${SCOUT_LIBFUZZER_SEC:-180}
     SCOUT_MAX_ARTIFACTS: ${SCOUT_MAX_ARTIFACTS:-20}
-    SCOUT_MAX_CANDIDATE_MB: ${SCOUT_MAX_CANDIDATE_MB:-2}
-    SCOUT_MAX_LOG_MB: ${SCOUT_MAX_LOG_MB:-2}
+    SCOUT_MAX_CANDIDATE_MB: ${SCOUT_MAX_CANDIDATE_MB:-4}
+    SCOUT_MAX_LOG_MB: ${SCOUT_MAX_LOG_MB:-16}
     SCOUT_FORCE: ${SCOUT_FORCE:-0}
     CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
     CYBERGYM_SERVER: ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
@@ -127,21 +127,21 @@ x-batch-args: &batch-args
   - --scout-mode
   - ${SCOUT_MODE:-off}
   - --scout-timeout-sec
-  - "${SCOUT_TIMEOUT_SEC:-180}"
+  - "${SCOUT_TIMEOUT_SEC:-420}"
   - --scout-run-timeout-sec
   - "${SCOUT_RUN_TIMEOUT_SEC:-10}"
   - --scout-max-runs
   - "${SCOUT_MAX_RUNS:-40}"
   - --scout-max-output-kb
-  - "${SCOUT_MAX_OUTPUT_KB:-32}"
+  - "${SCOUT_MAX_OUTPUT_KB:-128}"
   - --scout-libfuzzer-sec
-  - "${SCOUT_LIBFUZZER_SEC:-60}"
+  - "${SCOUT_LIBFUZZER_SEC:-180}"
   - --scout-max-artifacts
   - "${SCOUT_MAX_ARTIFACTS:-20}"
   - --scout-max-candidate-mb
-  - "${SCOUT_MAX_CANDIDATE_MB:-2}"
+  - "${SCOUT_MAX_CANDIDATE_MB:-4}"
   - --scout-max-log-mb
-  - "${SCOUT_MAX_LOG_MB:-2}"
+  - "${SCOUT_MAX_LOG_MB:-16}"
   - --force-scout
   - "${SCOUT_FORCE:-0}"
   # 单任务累计墙钟上限（秒），0 = 不限
