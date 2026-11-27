@@ -48,6 +48,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -129,6 +130,25 @@ FORBIDDEN_NAMES = ("error.txt", "patch.diff", "poc", "repo-fix.tar.gz", "repo-fi
 # --crash-hint：从官方 error.txt 派生少量定位信息写进 TASK.md，原文不落盘。
 CRASH_HINT_MODES = ("off", "entry", "full")
 SEED_CORPUS_MODES = ("off", "on")
+# pre-agent scout：宿主机 docker 执行，不进入 DinD。
+SCOUT_MODES = ("off", "quick", "boundary", "full")
+SCOUT_LOG_NAME = "scout_log.json"
+SCOUT_MARKDOWN_NAME = "SCOUT_LOG.md"
+SCOUT_BRIEF_BEGIN = "<!-- SCOUT_LOG_BEGIN -->"
+SCOUT_BRIEF_END = "<!-- SCOUT_LOG_END -->"
+SCOUT_CRASH_MARKERS = re.compile(
+    r"AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|"
+    r"HWAddressSanitizer|runtime error:|stack-overflow|SEGV|SIGSEGV|SIGABRT|ABRT|"
+    r"assertion",
+    re.IGNORECASE,
+)
+# libFuzzer 在 callback 签名不匹配时会用 UBSan 报进自己的 FuzzerLoop.cpp。
+# 这类错误在输入执行前就发生，不能算候选命中了目标库的漏洞。
+SCOUT_SCAFFOLD_CRASH_RE = re.compile(
+    r"incorrect function type|LLVMFuzzerTestOneInput defined here|"
+    r"/src/libfuzzer/(?:FuzzerLoop|FuzzerDriver|FuzzerMain)\.cpp",
+    re.IGNORECASE,
+)
 ENTRY_SCRIPTS = {
     "arvo": "/bin/arvo",
     "oss-fuzz": "/usr/local/bin/run_poc",
@@ -1320,6 +1340,7 @@ class RunOutcome:
     duration_sec: float
     result: dict = field(default_factory=dict)
     detail: str = ""
+    scout: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -1327,6 +1348,815 @@ class DindHandle:
     name: str
     data_volume: str
     run_volume: str
+
+
+# --------------------------------------------------------------------------- #
+# Pre-agent scout（宿主机 docker，不进入 DinD）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ScoutSeed:
+    name: str
+    data: bytes
+    parent: str
+
+
+@dataclass
+class ScoutResult:
+    stage: str
+    name: str
+    file: str
+    command: list[str] = field(default_factory=list)
+    exit_code: int | None = None
+    timed_out: bool = False
+    duration_sec: float = 0.0
+    verdict: str = "skipped"
+    sanitizer: str = ""
+    signature: dict = field(default_factory=dict)
+    parent: str | None = None
+    mutation: dict | None = None
+    output_tail: str = ""
+    note: str = ""
+
+
+@dataclass
+class ScoutBudget:
+    max_runs: int
+    deadline: float
+    runs: int = 0
+
+    def can_run(self) -> bool:
+        return self.runs < self.max_runs and time.monotonic() < self.deadline
+
+    def remaining_sec(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+
+def _scout_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _scout_safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "seed"
+
+
+def _scout_relative(task_root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(task_root / "task").as_posix()
+    except ValueError:
+        return path.name
+
+
+def _scout_tail(text: str, max_kb: int) -> str:
+    if not text or max_kb <= 0:
+        return ""
+    limit = max_kb * 1024
+    return text if len(text) <= limit else text[-limit:]
+
+
+def _scout_looks_like_crash(text: str) -> bool:
+    return bool(text and SCOUT_CRASH_MARKERS.search(text))
+
+
+def _classify_scout(exit_code: int | None, timed_out: bool, output: str) -> tuple[str, str]:
+    """把 scout 的退出码和输出分成稳定的 verdict。
+
+    125/126/127 是执行环境失败，不是崩溃；报告里大量 pre-mutation 失败属于这类。
+    """
+    if timed_out:
+        return "timeout", ""
+    if exit_code is None:
+        return "docker_error", ""
+    if exit_code == 0:
+        return "no_crash", ""
+    if exit_code in (124, 300, 999):
+        return "timeout", ""
+    if exit_code == 137:
+        return "killed", ""
+    if exit_code == 125:
+        return "docker_error", ""
+    if exit_code in (126, 127):
+        return "exec_error", ""
+    sanitizer = _sanitizer_from(output or "")
+    if SCOUT_SCAFFOLD_CRASH_RE.search(output or ""):
+        return "scaffold_error", sanitizer
+    if sanitizer or _scout_looks_like_crash(output):
+        return "crash", sanitizer
+    return "unknown_nonzero", ""
+
+
+def _scout_entry_command(task: TaskRef) -> list[str]:
+    # arvo 镜像没有 entrypoint，必须显式跑 /bin/arvo；oss-fuzz 镜像默认 CMD 就是
+    # run_poc，直接 docker run 即可。
+    return ["/bin/arvo"] if task.family != "oss-fuzz" else []
+
+
+def _scout_run(
+    task: TaskRef,
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    mounts: list[tuple[Path, str, str]],
+    command: list[str],
+    timeout: float,
+    entrypoint: str | None = None,
+) -> ScoutResult:
+    """在宿主机 daemon 上跑一个短生命周期 scout 容器。"""
+    started = time.monotonic()
+    name = f"trilane-scout-{task.slug}-{stage[:4]}-{uuid.uuid4().hex[:6]}"
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        name,
+        "--network",
+        "none",
+        "--label",
+        "trilane.role=scout",
+        "--label",
+        f"trilane.task={task.slug}",
+        "--label",
+        f"trilane.batch={getattr(args, 'agent_id', 'scout')}",
+    ]
+    if entrypoint:
+        cmd.extend(["--entrypoint", entrypoint])
+    for host, target, mode in mounts:
+        cmd.extend(["-v", f"{daemon_path(host)}:{target}:{mode}"])
+    cmd.append(task.vul_image)
+    cmd.extend(command)
+    if timeout <= 0:
+        return ScoutResult(
+            stage=stage,
+            name=name,
+            file="",
+            command=cmd,
+            verdict="skipped",
+            note="budget_exhausted",
+        )
+
+    def execute(attempt_cmd: list[str]) -> ScoutResult:
+        try:
+            proc = run(attempt_cmd, timeout=timeout)
+            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+            verdict, sanitizer = _classify_scout(proc.returncode, False, output)
+            return ScoutResult(
+                stage=stage,
+                name=name,
+                file="",
+                command=attempt_cmd,
+                exit_code=proc.returncode,
+                duration_sec=round(time.monotonic() - started, 3),
+                verdict=verdict,
+                sanitizer=sanitizer,
+                signature=_parse_crash_signature(output) if output else {},
+                output_tail=_scout_tail(
+                    output, _scout_int(getattr(args, "scout_max_output_kb", 32), 32)
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            # docker run 的客户端被 kill 后，容器可能还在；按唯一名字清掉自己的容器。
+            try:
+                run(["docker", "rm", "-f", name], timeout=30)
+            except Exception:  # noqa: BLE001 - 清理失败不能覆盖原始超时
+                pass
+            return ScoutResult(
+                stage=stage,
+                name=name,
+                file="",
+                command=attempt_cmd,
+                timed_out=True,
+                duration_sec=round(time.monotonic() - started, 3),
+                verdict="timeout",
+            )
+        except Exception as exc:  # noqa: BLE001 - scout 失败必须软降级
+            return ScoutResult(
+                stage=stage,
+                name=name,
+                file="",
+                command=attempt_cmd,
+                duration_sec=round(time.monotonic() - started, 3),
+                verdict="docker_error",
+                note=f"{type(exc).__name__}: {exc}",
+            )
+
+    result = execute(cmd)
+    # 少数 arvo harness 把 /tmp/poc 当 corpus 目录而不是单文件。这类镜像对普通
+    # 文件输入会报 "required directory"，只在第一次执行暴露该契约时重试一次。
+    if (
+        stage in ("quick_try", "boundary")
+        and result.verdict in ("unknown_nonzero", "exec_error")
+        and "required directory" in result.output_tail
+        and result.duration_sec < timeout
+    ):
+        dir_name = f"{name}-dir"
+        corpus_dir = host.parent / f"dir-{host.name}"
+        try:
+            safe_mkdir(corpus_dir)
+            shutil.copyfile(host, corpus_dir / host.name)
+        except OSError as exc:
+            log(f"[{task.task_id}] scout 目录模式重试准备失败：{exc}")
+            return result
+        dir_cmd = [
+            "docker", "run", "--rm", "--name", dir_name,
+            "--network", "none",
+            "--label", "trilane.role=scout",
+            "--label", f"trilane.task={task.slug}",
+            "--label", f"trilane.batch={getattr(args, 'agent_id', 'scout')}",
+            "-v", f"{daemon_path(corpus_dir)}:/tmp/poc:ro",
+            task.vul_image,
+            "/bin/arvo",
+        ] if task.family != "oss-fuzz" else [
+            "docker", "run", "--rm", "--name", dir_name,
+            "--network", "none",
+            "--label", "trilane.role=scout",
+            "--label", f"trilane.task={task.slug}",
+            "--label", f"trilane.batch={getattr(args, 'agent_id', 'scout')}",
+            "-v", f"{daemon_path(corpus_dir)}:/tmp/poc:ro",
+            task.vul_image,
+        ]
+        dir_result = execute(dir_cmd)
+        dir_result.name = dir_name
+        dir_result.note = "directory_mode_retry"
+        return dir_result
+    return result
+
+
+def _scout_seed_blobs(task_root: Path, args: argparse.Namespace) -> list[ScoutSeed]:
+    """读取 task/seeds 下的 zip；不解压到目录，只把候选字节读进内存。"""
+    if getattr(args, "seed_corpus", "on") != "on":
+        return []
+    seeds_dir = task_root / "task" / "seeds"
+    if not seeds_dir.is_dir():
+        return []
+    max_files = max(1, _scout_int(getattr(args, "scout_max_runs", 40), 40))
+    max_bytes = max(1, _scout_int(getattr(args, "scout_max_candidate_mb", 2), 2)) * 1024 * 1024
+    blobs: list[ScoutSeed] = []
+    for zip_path in sorted(seeds_dir.glob("*_seed_corpus.zip")):
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                infos = sorted(
+                    (item for item in archive.infolist() if not item.is_dir()),
+                    key=lambda item: item.filename,
+                )
+                for info in infos:
+                    if len(blobs) >= max_files:
+                        break
+                    if info.file_size > max_bytes:
+                        continue
+                    try:
+                        data = archive.read(info)
+                    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                        log(f"[{task_root.name}] 读取 scout seed 失败 {zip_path.name}/{info.filename}: {exc}")
+                        continue
+                    if len(data) > max_bytes:
+                        continue
+                    safe = _scout_safe_name(Path(info.filename).name)
+                    parent = f"seeds/{zip_path.name}#{info.filename}"
+                    blobs.append(
+                        ScoutSeed(
+                            name=f"{zip_path.stem}-{len(blobs):03d}-{safe}",
+                            data=data,
+                            parent=parent,
+                        )
+                    )
+        except (OSError, zipfile.BadZipFile) as exc:
+            log(f"[{task_root.name}] 跳过损坏的 scout seed zip {zip_path.name}: {exc}")
+    return blobs
+
+
+def _scout_stage_info(
+    results: list[ScoutResult],
+    duration_sec: float,
+    *,
+    reason: str = "",
+) -> dict:
+    return {
+        "status": "skipped" if reason else "ok",
+        "ran": len(results),
+        "crashes": sum(1 for item in results if item.verdict == "crash"),
+        "duration_sec": round(duration_sec, 3),
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def _scout_quick_try(
+    task: TaskRef,
+    args: argparse.Namespace,
+    task_root: Path,
+    scout_dir: Path,
+    budget: ScoutBudget,
+    seeds: list[ScoutSeed],
+) -> tuple[list[ScoutResult], dict]:
+    stage_dir = scout_dir / "quick-try"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    results: list[ScoutResult] = []
+    sources: list[tuple[str, bytes, str | None]] = [("empty", b"", None)]
+    sources.extend((seed.name, seed.data, seed.parent) for seed in seeds)
+    per_run = max(1.0, _scout_int(getattr(args, "scout_run_timeout_sec", 10), 10))
+    for index, (name, data, parent) in enumerate(sources):
+        if not budget.can_run():
+            break
+        timeout = min(per_run, budget.remaining_sec())
+        if timeout < 0.5:
+            break
+        candidate = stage_dir / f"{index:03d}-{_scout_safe_name(name)}.bin"
+        try:
+            candidate.write_bytes(data)
+        except OSError as exc:
+            log(f"[{task.task_id}] scout 候选写入失败 {candidate}: {exc}")
+            continue
+        result = _scout_run(
+            task,
+            args,
+            stage="quick_try",
+            mounts=[(candidate, "/tmp/poc", "ro")],
+            command=_scout_entry_command(task),
+            timeout=timeout,
+        )
+        result.name = f"quick-{index:03d}"
+        result.file = _scout_relative(task_root, candidate)
+        result.parent = parent
+        budget.runs += 1
+        results.append(result)
+    return results, _scout_stage_info(results, time.monotonic() - started)
+
+
+def _scout_boundary_variants(data: bytes, *, limit: int):
+    """固定、确定性的 boundary 变异；按截断/追加/字段覆盖排序。"""
+    emitted = 0
+
+    def emit(blob: bytes, mutation: dict):
+        nonlocal emitted
+        if emitted >= limit:
+            return False
+        emitted += 1
+        return (blob, mutation)
+
+    lengths = sorted({0, 1, 2, 4, 8, 16, len(data) // 4, len(data) // 2, max(0, len(data) - 1)})
+    for length in lengths:
+        if length <= len(data):
+            item = emit(data[:length], {"kind": "truncate", "length": length})
+            if item is False:
+                return
+            if item:
+                yield item
+    for extra in (1, 2, 4):
+        item = emit(data + b"\x00" * extra, {"kind": "append", "bytes": extra})
+        if item is False:
+            return
+        if item:
+            yield item
+    for offset in (0, 4, 8, 12, 16):
+        for width in (1, 2, 4):
+            if offset + width > len(data):
+                continue
+            for value in (0, 1, 0x7F, 0x80, 0xFF):
+                blob = bytearray(data)
+                blob[offset : offset + width] = (value & ((1 << (width * 8)) - 1)).to_bytes(
+                    width, "little"
+                )
+                item = emit(
+                    bytes(blob),
+                    {
+                        "kind": "overwrite",
+                        "offset": offset,
+                        "width": width,
+                        "value": value,
+                        "encoding": "little",
+                    },
+                )
+                if item is False:
+                    return
+                if item:
+                    yield item
+
+
+def _scout_boundary(
+    task: TaskRef,
+    args: argparse.Namespace,
+    task_root: Path,
+    scout_dir: Path,
+    budget: ScoutBudget,
+    seeds: list[ScoutSeed],
+) -> tuple[list[ScoutResult], dict]:
+    stage_dir = scout_dir / "boundary"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    results: list[ScoutResult] = []
+    selected = seeds[:2]
+    if not selected:
+        return results, _scout_stage_info(results, 0, reason="no_seeds")
+    per_run = max(1.0, _scout_int(getattr(args, "scout_run_timeout_sec", 10), 10))
+    limit = max(8, _scout_int(getattr(args, "scout_max_runs", 40), 40))
+    index = 0
+    for seed in selected:
+        for blob, mutation in _scout_boundary_variants(seed.data, limit=limit):
+            if not budget.can_run():
+                break
+            timeout = min(per_run, budget.remaining_sec())
+            if timeout < 0.5:
+                break
+            candidate = stage_dir / f"{index:03d}-{_scout_safe_name(seed.name)}.bin"
+            try:
+                candidate.write_bytes(blob)
+            except OSError as exc:
+                log(f"[{task.task_id}] scout 变异写入失败 {candidate}: {exc}")
+                continue
+            result = _scout_run(
+                task,
+                args,
+                stage="boundary",
+                mounts=[(candidate, "/tmp/poc", "ro")],
+                command=_scout_entry_command(task),
+                timeout=timeout,
+            )
+            result.name = f"boundary-{index:03d}"
+            result.file = _scout_relative(task_root, candidate)
+            result.parent = seed.name
+            result.mutation = mutation
+            budget.runs += 1
+            results.append(result)
+            index += 1
+        if not budget.can_run():
+            break
+    return results, _scout_stage_info(results, time.monotonic() - started)
+
+
+def _scout_canonical_fuzzers(task: TaskRef, task_root: Path) -> list[str]:
+    manifest_path = task_root / "task" / "seeds" / "manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        values = payload.get("canonical_fuzzers") or []
+        if isinstance(values, list):
+            return [str(value) for value in values if str(value)]
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        return _canonical_fuzzers(task, ["docker"])
+    except Exception:  # noqa: BLE001 - optional aid
+        return []
+
+
+def _scout_libfuzzer(
+    task: TaskRef,
+    args: argparse.Namespace,
+    scout_dir: Path,
+    budget: ScoutBudget,
+    seeds: list[ScoutSeed],
+    task_root: Path,
+) -> tuple[list[ScoutResult], dict]:
+    stage_dir = scout_dir / "libfuzzer"
+    corpus_dir = stage_dir / "corpus"
+    artifacts_dir = stage_dir / "artifacts"
+    # 新一次 scout 不继承上一次的 corpus/artifact，避免把旧候选算进本次结果。
+    shutil.rmtree(corpus_dir, ignore_errors=True)
+    shutil.rmtree(artifacts_dir, ignore_errors=True)
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    results: list[ScoutResult] = []
+    if not seeds:
+        return results, _scout_stage_info(results, 0, reason="no_seeds")
+    fuzzers = _scout_canonical_fuzzers(task, task_root)
+    if not fuzzers:
+        return results, _scout_stage_info(results, 0, reason="no_canonical_fuzzer")
+    fuzzer = fuzzers[0]
+    for index, seed in enumerate(seeds):
+        try:
+            (corpus_dir / f"{index:03d}-{_scout_safe_name(seed.name)}.bin").write_bytes(seed.data)
+        except OSError:
+            continue
+    probe_timeout = min(10.0, budget.remaining_sec())
+    if probe_timeout < 0.5:
+        return results, _scout_stage_info(results, 0, reason="budget_exhausted")
+    probe = _scout_run(
+        task,
+        args,
+        stage="libfuzzer",
+        mounts=[],
+        command=[
+            "-c",
+            f"test -x /out/{fuzzer} && /out/{fuzzer} -help=1 2>&1",
+        ],
+        timeout=probe_timeout,
+        entrypoint="/bin/sh",
+    )
+    if probe.exit_code != 0 or "max_total_time" not in probe.output_tail:
+        return results, _scout_stage_info(results, time.monotonic() - started, reason="not_libfuzzer")
+    campaign_timeout = min(
+        max(1.0, float(_scout_int(getattr(args, "scout_libfuzzer_sec", 60), 60))),
+        budget.remaining_sec(),
+    )
+    if campaign_timeout < 0.5:
+        return results, _scout_stage_info(results, time.monotonic() - started, reason="budget_exhausted")
+    campaign = _scout_run(
+        task,
+        args,
+        stage="libfuzzer",
+        mounts=[
+            (corpus_dir, "/corpus", "ro"),
+            (artifacts_dir, "/artifacts", "rw"),
+        ],
+        command=[
+            f"/out/{fuzzer}",
+            f"-max_total_time={int(campaign_timeout)}",
+            "-artifact_prefix=/artifacts/",
+            "/corpus",
+        ],
+        timeout=min(campaign_timeout + 5, budget.remaining_sec()),
+    )
+    campaign.name = "libfuzzer-campaign"
+    campaign.file = ""
+    results.append(campaign)
+    budget.runs += 1
+    # campaign 是 scaffold error 时，libFuzzer 仍会写 artifact，但这不是候选命中。
+    if campaign.verdict in ("scaffold_error", "exec_error", "docker_error"):
+        return results, _scout_stage_info(
+            results, time.monotonic() - started, reason=campaign.verdict
+        )
+    max_artifacts = max(0, _scout_int(getattr(args, "scout_max_artifacts", 20), 20))
+    artifact_files = sorted(
+        (path for path in artifacts_dir.iterdir() if path.is_file()),
+        key=lambda path: path.name,
+    )[:max_artifacts]
+    for index, artifact in enumerate(artifact_files):
+        item = ScoutResult(
+            stage="libfuzzer",
+            name=f"libfuzzer-{index:03d}",
+            file=_scout_relative(task_root, artifact),
+            verdict="crash",
+            sanitizer=campaign.sanitizer,
+            signature=campaign.signature,
+            output_tail=campaign.output_tail,
+            note="libfuzzer artifact",
+        )
+        results.append(item)
+    return results, _scout_stage_info(results, time.monotonic() - started)
+
+
+def _scout_result_dict(result: ScoutResult) -> dict:
+    payload = {
+        "id": result.name,
+        "stage": result.stage,
+        "file": result.file,
+        "verdict": result.verdict,
+        "exit_code": result.exit_code,
+        "timed_out": result.timed_out,
+        "duration_sec": result.duration_sec,
+        "sanitizer": result.sanitizer,
+        "signature": result.signature,
+        "output_tail": result.output_tail,
+    }
+    if result.parent:
+        payload["parent"] = result.parent
+    if result.mutation:
+        payload["mutation"] = result.mutation
+    if result.note:
+        payload["note"] = result.note
+    return payload
+
+
+def _scout_summary(log: dict) -> dict:
+    stages = log.get("stages") if isinstance(log.get("stages"), dict) else {}
+    candidates = log.get("candidates") if isinstance(log.get("candidates"), list) else []
+    return {
+        "mode": log.get("mode"),
+        "isolation": log.get("isolation", "host"),
+        "status": log.get("status"),
+        "duration_sec": log.get("duration_sec"),
+        "stages": stages,
+        "candidates": len(candidates),
+        "crashes": sum(
+            1 for item in candidates if isinstance(item, dict) and item.get("verdict") == "crash"
+        ),
+        "log": log.get("log") or f"scout/{SCOUT_LOG_NAME}",
+    }
+
+
+def _write_scout_log(
+    task: TaskRef,
+    scout_dir: Path,
+    *,
+    mode: str,
+    started_at: str,
+    duration_sec: float,
+    stages: dict,
+    results: list[ScoutResult],
+    status: str,
+    max_log_mb: int,
+) -> dict:
+    candidates = [_scout_result_dict(item) for item in results]
+    payload = {
+        "schema": 1,
+        "task_id": task.task_id,
+        "mode": mode,
+        "isolation": "host",
+        "status": status,
+        "started_at": started_at,
+        "duration_sec": round(duration_sec, 3),
+        "stages": stages,
+        "candidates": candidates,
+        "log": f"scout/{SCOUT_LOG_NAME}",
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    limit = max(1, max_log_mb) * 1024 * 1024
+    if len(encoded.encode("utf-8")) > limit:
+        for item in candidates:
+            item["output_tail"] = ""
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(encoded.encode("utf-8")) > limit:
+        # 极端情况下只保留前若干个候选，日志本身不能拖垮结果落账。
+        payload["candidates"] = candidates[:20]
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    (scout_dir / SCOUT_LOG_NAME).write_text(encoded, encoding="utf-8")
+    return payload
+
+
+def _render_scout_markdown(payload: dict) -> str:
+    lines = [
+        "# Pre-agent scout log",
+        "",
+        f"- mode: {payload.get('mode')}",
+        "- isolation: host",
+        f"- duration: {payload.get('duration_sec')}s",
+        "",
+    ]
+    for stage, info in (payload.get("stages") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        line = f"- {stage}: ran={info.get('ran', 0)} crash={info.get('crashes', 0)}"
+        if info.get("reason"):
+            line += f" skipped={info['reason']}"
+        lines.append(line)
+    crashes = [
+        item for item in payload.get("candidates") or []
+        if isinstance(item, dict) and item.get("verdict") == "crash"
+    ]
+    lines.extend(["", "## Crashes", ""])
+    if not crashes:
+        lines.append("None.")
+    for index, item in enumerate(crashes[:10], 1):
+        detail = f"{index}. `{item.get('file') or item.get('id')}` — {item.get('stage')}"
+        if item.get("exit_code") is not None:
+            detail += f" — exit={item.get('exit_code')}"
+        if item.get("sanitizer"):
+            detail += f" — {item.get('sanitizer')}"
+        lines.append(detail)
+        if item.get("parent"):
+            lines.append(f"   - parent: {item['parent']}")
+        if item.get("mutation"):
+            lines.append(f"   - mutation: {json.dumps(item['mutation'], ensure_ascii=False)}")
+    return "\n".join(lines) + "\n"
+
+
+def _append_scout_brief(task_root: Path, summary: dict) -> None:
+    task_md = task_root / "task" / "TASK.md"
+    try:
+        text = task_md.read_text(encoding="utf-8")
+    except OSError:
+        return
+    text = re.sub(
+        re.escape(SCOUT_BRIEF_BEGIN) + r".*?" + re.escape(SCOUT_BRIEF_END) + r"\n?",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    stage_lines = []
+    for stage, info in (summary.get("stages") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        line = f"- {stage}: ran={info.get('ran', 0)} crash={info.get('crashes', 0)}"
+        if info.get("reason"):
+            line += f" (skipped: {info['reason']})"
+        stage_lines.append(line)
+    block = "\n".join(
+        [
+            SCOUT_BRIEF_BEGIN,
+            "## Pre-agent scout results (vulnerable side only)",
+            "",
+            "The runner executed bounded scouts before this round. These are diagnostic",
+            "starting points, not verified answers. You may inspect them, but validate any",
+            "candidate independently through the vulnerable target before submitting.",
+            "",
+            f"- mode: {summary.get('mode')}",
+            *stage_lines,
+            "",
+            "Candidates are under `scout/`; details are in `scout/scout_log.json`.",
+            SCOUT_BRIEF_END,
+            "",
+        ]
+    )
+    if text and not text.endswith("\n"):
+        text += "\n"
+    task_md.write_text(text + block, encoding="utf-8")
+
+
+def run_scouts(task: TaskRef, task_root: Path, args: argparse.Namespace) -> dict:
+    """在 agent 启动前运行宿主机 scout；失败只记录，不抛出。"""
+    mode = str(getattr(args, "scout_mode", "off") or "off")
+    if mode not in SCOUT_MODES or mode == "off":
+        return {}
+    scout_dir = task_root / "task" / "scout"
+    scout_dir.mkdir(parents=True, exist_ok=True)
+    log_path = scout_dir / SCOUT_LOG_NAME
+    if log_path.exists() and not getattr(args, "force_scout", False):
+        try:
+            existing = json.loads(log_path.read_text(encoding="utf-8"))
+            if existing.get("mode") == mode:
+                summary = _scout_summary(existing)
+                _append_scout_brief(task_root, summary)
+                return summary
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    started = time.monotonic()
+    timeout_sec = max(1.0, float(_scout_int(getattr(args, "scout_timeout_sec", 180), 180)))
+    budget = ScoutBudget(
+        max_runs=max(1, _scout_int(getattr(args, "scout_max_runs", 40), 40)),
+        deadline=started + timeout_sec,
+    )
+    stages: dict = {}
+    results: list[ScoutResult] = []
+    status = "ok"
+    try:
+        seeds = _scout_seed_blobs(task_root, args)
+        if mode in ("quick", "boundary", "full"):
+            stage_started = time.monotonic()
+            stage_results, info = _scout_quick_try(
+                task, args, task_root, scout_dir, budget, seeds
+            )
+            results.extend(stage_results)
+            info["duration_sec"] = round(time.monotonic() - stage_started, 3)
+            stages["quick_try"] = info
+        if mode in ("boundary", "full"):
+            stage_started = time.monotonic()
+            stage_results, info = _scout_boundary(
+                task, args, task_root, scout_dir, budget, seeds
+            )
+            results.extend(stage_results)
+            info["duration_sec"] = round(time.monotonic() - stage_started, 3)
+            stages["boundary"] = info
+        if mode == "full":
+            stage_started = time.monotonic()
+            stage_results, info = _scout_libfuzzer(
+                task, args, scout_dir, budget, seeds, task_root
+            )
+            results.extend(stage_results)
+            info["duration_sec"] = round(time.monotonic() - stage_started, 3)
+            stages["libfuzzer"] = info
+    except Exception as exc:  # noqa: BLE001 - scout 不能阻断 agent
+        status = "failed"
+        log(f"[{task.task_id}] scout 失败（继续 agent）：{type(exc).__name__}: {exc}")
+
+    duration_sec = time.monotonic() - started
+    if any(info.get("status") == "skipped" for info in stages.values()):
+        status = "partial" if status == "ok" else status
+    payload = _write_scout_log(
+        task,
+        scout_dir,
+        mode=mode,
+        started_at=started_at,
+        duration_sec=duration_sec,
+        stages=stages,
+        results=results,
+        status=status,
+        max_log_mb=max(1, _scout_int(getattr(args, "scout_max_log_mb", 2), 2)),
+    )
+    (scout_dir / SCOUT_MARKDOWN_NAME).write_text(
+        _render_scout_markdown(payload), encoding="utf-8"
+    )
+    summary = _scout_summary(payload)
+    _append_scout_brief(task_root, summary)
+    log(
+        f"[{task.task_id}] scout {mode}: {summary.get('candidates', 0)} candidates, "
+        f"{sum(info.get('crashes', 0) for info in stages.values() if isinstance(info, dict))} crashes, "
+        f"{duration_sec:.1f}s"
+    )
+    return summary
+
+
+def _run_scouts_safe(task: TaskRef, task_root: Path, args: argparse.Namespace) -> dict:
+    """run_scouts 的兜底：任何异常都不能阻断 agent。"""
+    try:
+        return run_scouts(task, task_root, args)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[{task.task_id}] scout 初始化失败（继续 agent）：{type(exc).__name__}: {exc}")
+        return {
+            "mode": str(getattr(args, "scout_mode", "off") or "off"),
+            "isolation": "host",
+            "status": "failed",
+            "duration_sec": 0.0,
+            "stages": {},
+            "candidates": 0,
+            "log": "",
+        }
 
 
 def snapshot_transcript_sizes(state_dir: Path) -> dict[Path, int]:
@@ -1950,6 +2780,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
     d_state = daemon_path(state_dir)
 
     started = time.monotonic()
+    scout_summary: dict = {}
     # started_epoch = time.time()
     # 先记下各 transcript 当前大小，之后只扫新增部分，避免上一次尝试的
     # ENOSPC 行被这次重跑重新扫出来（见 snapshot_transcript_sizes）。
@@ -2003,6 +2834,9 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                     f"DinD 初始化失败：{exc}",
                 )
 
+            # scout 固定走宿主机 daemon，不进入 dind；它的耗时不算 agent 时间。
+            scout_summary = _run_scouts_safe(task, task_root, args)
+            agent_started = time.monotonic()
             rc = run_agent_in_dind(
                 dind,
                 container=container,
@@ -2014,7 +2848,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                 args=args,
                 log_path=log_path,
             )
-            duration = time.monotonic() - started
+            duration = time.monotonic() - agent_started
         else:
             # host 模式不导入镜像（agent 直接用宿主 daemon 里的镜像），
             # 只查运行盘：任务目录所在盘的可用空间要覆盖本任务预留 + 其他在跑任务的预留。
@@ -2027,6 +2861,8 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                 if blocked is not None:
                     return blocked
             provision_seed_corpora(task, task_root, args)
+            scout_summary = _run_scouts_safe(task, task_root, args)
+            agent_started = time.monotonic()
             cmd = [
                 "docker", "run", "--rm", "--name", container,
                 "--label", "trilane.role=agent",
@@ -2068,7 +2904,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                         proc.kill()
                         proc.wait(timeout=60)
                     rc = None
-            duration = time.monotonic() - started
+            duration = time.monotonic() - agent_started
 
         result_path = out_dir / "result.json"
         result: dict = {}
@@ -2093,11 +2929,27 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
         #     )
 
         if rc is None:
-            return RunOutcome("timeout", None, duration, result, f"硬超时 {args.timeout_sec + 600}s，已强杀容器")
+            return RunOutcome(
+                "timeout",
+                None,
+                duration,
+                result,
+                f"硬超时 {args.timeout_sec + 600}s，已强杀容器",
+                scout=scout_summary,
+            )
         status = str(result.get("status") or "")
         if not status:
-            return RunOutcome("container_failed", rc, duration, result, f"没有 result.json（退出码 {rc}），见 agent.log")
-        return RunOutcome(status, rc, duration, result, str(result.get("error") or ""))
+            return RunOutcome(
+                "container_failed",
+                rc,
+                duration,
+                result,
+                f"没有 result.json（退出码 {rc}），见 agent.log",
+                scout=scout_summary,
+            )
+        return RunOutcome(
+            status, rc, duration, result, str(result.get("error") or ""), scout=scout_summary
+        )
     finally:
         if dind is not None:
             log(f"[{task.task_id}] 清理 DinD {dind.name}")
@@ -3198,6 +4050,7 @@ def _blocked_gate_candidates(
 
 def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_root: Path) -> dict:
     task_root = out_root / task.slug
+    task_started = time.monotonic()
     record: dict = {
         "task_id": task.task_id,
         "masked_id": task.masked_id,
@@ -3254,6 +4107,8 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                     }
                 )
         outcome = run_agent(task, task_root, args)
+        if outcome.scout:
+            record["scout"] = outcome.scout
         artifacts = record.setdefault("artifacts", [])
         artifacts.append(
             seal_attempt(task_root, 1, task=task, result=outcome.result, record=record)
@@ -3324,6 +4179,8 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
                 )
             time.sleep(wait)
             outcome = run_agent(task, task_root, args)
+            if outcome.scout:
+                record["scout"] = outcome.scout
             artifacts.append(
                 seal_attempt(
                     task_root, attempts, task=task, result=outcome.result, record=record
@@ -3580,6 +4437,7 @@ def run_one(task: TaskRef, args: argparse.Namespace, client: SubmitClient, out_r
         return record
     finally:
         record["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        record["task_total_sec"] = round(time.monotonic() - task_started, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -3654,6 +4512,67 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="on",
         help="是否允许使用目标镜像 /out 下的种子语料：on=允许（默认，动态分析），"
         "off=不允许（严格 level 1）",
+    )
+    parser.add_argument(
+        "--scout-mode",
+        choices=SCOUT_MODES,
+        default=os.environ.get("SCOUT_MODE", "off"),
+        help="agent 启动前的 scout：off/quick/boundary/full；固定走宿主机 docker",
+    )
+    parser.add_argument(
+        "--scout-timeout-sec",
+        type=int,
+        default=int(os.environ.get("SCOUT_TIMEOUT_SEC", "180") or 180),
+        help="scout 阶段总墙钟上限（秒），独立于 agent 超时",
+    )
+    parser.add_argument(
+        "--scout-run-timeout-sec",
+        type=int,
+        default=int(os.environ.get("SCOUT_RUN_TIMEOUT_SEC", "10") or 10),
+        help="单个 scout 目标执行上限（秒）",
+    )
+    parser.add_argument(
+        "--scout-max-runs",
+        type=int,
+        default=int(os.environ.get("SCOUT_MAX_RUNS", "40") or 40),
+        help="整个任务最多执行多少个 scout 候选",
+    )
+    parser.add_argument(
+        "--scout-max-output-kb",
+        type=int,
+        default=int(os.environ.get("SCOUT_MAX_OUTPUT_KB", "32") or 32),
+        help="每个 scout 候选保留的输出尾部（KB）",
+    )
+    parser.add_argument(
+        "--scout-libfuzzer-sec",
+        type=int,
+        default=int(os.environ.get("SCOUT_LIBFUZZER_SEC", "60") or 60),
+        help="libFuzzer campaign 时长（秒）",
+    )
+    parser.add_argument(
+        "--scout-max-artifacts",
+        type=int,
+        default=int(os.environ.get("SCOUT_MAX_ARTIFACTS", "20") or 20),
+        help="libFuzzer artifact 最多收集多少个",
+    )
+    parser.add_argument(
+        "--scout-max-candidate-mb",
+        type=int,
+        default=int(os.environ.get("SCOUT_MAX_CANDIDATE_MB", "2") or 2),
+        help="单个 scout 候选文件大小上限（MB）",
+    )
+    parser.add_argument(
+        "--scout-max-log-mb",
+        type=int,
+        default=int(os.environ.get("SCOUT_MAX_LOG_MB", "2") or 2),
+        help="scout JSON 日志大小上限（MB）",
+    )
+    parser.add_argument(
+        "--force-scout",
+        type=bool_value,
+        default=bool_value(os.environ.get("SCOUT_FORCE", "0")),
+        metavar="{0,1}",
+        help="忽略已有 scout 日志，重新运行 scout；默认 0（复用）",
     )
     parser.add_argument(
         "--agent-image",
