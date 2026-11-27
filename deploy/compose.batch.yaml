@@ -57,6 +57,17 @@ x-batch-common: &batch-common
     # 诊断用的目录扫描上限；bundle / manifest 候选不受影响。
     POC_SCAN_MAX_FILES: ${POC_SCAN_MAX_FILES:-500}
     POC_SCAN_MAX_MB: ${POC_SCAN_MAX_MB:-20}
+    # pre-agent scout（宿主机 docker）
+    SCOUT_MODE: ${SCOUT_MODE:-on}
+    SCOUT_TIMEOUT_SEC: ${SCOUT_TIMEOUT_SEC:-180}
+    SCOUT_RUN_TIMEOUT_SEC: ${SCOUT_RUN_TIMEOUT_SEC:-10}
+    SCOUT_MAX_RUNS: ${SCOUT_MAX_RUNS:-40}
+    SCOUT_MAX_OUTPUT_KB: ${SCOUT_MAX_OUTPUT_KB:-32}
+    SCOUT_LIBFUZZER_SEC: ${SCOUT_LIBFUZZER_SEC:-60}
+    SCOUT_MAX_ARTIFACTS: ${SCOUT_MAX_ARTIFACTS:-20}
+    SCOUT_MAX_CANDIDATE_MB: ${SCOUT_MAX_CANDIDATE_MB:-2}
+    SCOUT_MAX_LOG_MB: ${SCOUT_MAX_LOG_MB:-2}
+    SCOUT_FORCE: ${SCOUT_FORCE:-0}
     CYBERGYM_DATA_DIR: ${DATA_DIR:-/opt/cybergym_data}
     CYBERGYM_SERVER: ${CYBERGYM_SERVER:-http://127.0.0.1:8666}
     CYBERGYM_API_KEY: ${CYBERGYM_API_KEY:?CYBERGYM_API_KEY is required in .env}
@@ -112,6 +123,27 @@ x-batch-args: &batch-args
   # 是否允许使用目标镜像 /out 下的种子语料；on=允许（默认，动态分析），off=严格 level 1
   - --seed-corpus
   - ${SEED_CORPUS:-on}
+  # pre-agent scout：off / quick / boundary / full（宿主机 docker，独立超时）
+  - --scout-mode
+  - ${SCOUT_MODE:-off}
+  - --scout-timeout-sec
+  - "${SCOUT_TIMEOUT_SEC:-180}"
+  - --scout-run-timeout-sec
+  - "${SCOUT_RUN_TIMEOUT_SEC:-10}"
+  - --scout-max-runs
+  - "${SCOUT_MAX_RUNS:-40}"
+  - --scout-max-output-kb
+  - "${SCOUT_MAX_OUTPUT_KB:-32}"
+  - --scout-libfuzzer-sec
+  - "${SCOUT_LIBFUZZER_SEC:-60}"
+  - --scout-max-artifacts
+  - "${SCOUT_MAX_ARTIFACTS:-20}"
+  - --scout-max-candidate-mb
+  - "${SCOUT_MAX_CANDIDATE_MB:-2}"
+  - --scout-max-log-mb
+  - "${SCOUT_MAX_LOG_MB:-2}"
+  - --force-scout
+  - "${SCOUT_FORCE:-0}"
   # 单任务累计墙钟上限（秒），0 = 不限
   - --task-wall-clock-sec
   - "${TASK_WALL_CLOCK_SEC:-0}"

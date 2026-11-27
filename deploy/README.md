@@ -349,6 +349,9 @@ POC_SCAN_MAX_FILES=500                # 诊断扫描最多读取多少个文件�
 POC_SCAN_MAX_MB=20                    # 诊断扫描最多读取多少 MB（0 = 不限）
 CRASH_HINT=entry                      # 见 §7：entry / full / off
 SEED_CORPUS=on                        # on=允许使用 /out 下的种子语料（动态分析）；off=严格 level 1
+SCOUT_MODE=off                        # off / quick / boundary / full；宿主机执行，不占 agent 超时
+SCOUT_TIMEOUT_SEC=180                 # scout 独立墙钟上限
+SCOUT_MAX_RUNS=40                     # 整个任务最多执行多少个 scout 候选
 ```
 
 先干跑（只做 preflight + 准备任务包，不启动智能体）：
@@ -474,6 +477,14 @@ runner 起的 dind 是**兄弟容器**（sibling），智能体又跑在 dind �
 | `--agent-retries` | 1 | 智能体因 OOM/启动失败中断时批内自动重试次数 |
 | `--max-submits` | 3 | 最多试几个候选；最终只报 1 个答案 |
 | `--verify-rounds` | 3 | 每个候选重复提交几轮取多数票 |
+| `--seed-corpus` | on | 是否允许使用目标镜像 `/out` 下的种子语料；off=严格 level 1 |
+| `--scout-mode` | off | pre-agent scout：off / quick / boundary / full；固定走宿主机 docker，不占 agent 超时 |
+| `--scout-timeout-sec` | 180 | scout 阶段独立墙钟上限，不从 `--timeout-sec` 扣减 |
+| `--scout-max-runs` | 40 | 整个任务最多执行多少个 scout 候选 |
+
+> `--scout-mode` 不为 `off` 时，scout 固定用**宿主机 docker daemon** 执行目标镜像，
+> 即使 `--isolation dind` 也不进入 dind；它的耗时记在 `scout.duration_sec`，
+> 不占 `agent_duration_sec`。
 | `--work-root` | `runs/cybergym-<时间戳>` | 产物根目录 |
 | `--dry-run` | 关 | 只准备任务包，不跑 |
 | `--pull-missing` | 关 | preflight 发现缺 vul 镜像时自动拉 |
@@ -514,7 +525,7 @@ regmatch 缺陷，rank-2 才是这道题要修的 `softmagic.c` 缺陷。
   report.md              # 汇总表：状态、vul/fix 退出码、投票明细、耗时
   results.jsonl          # 每任务一行，可断点续跑
   <task-slug>/
-    task/{TASK.md, description.txt, src/, poc/}   # 智能体工作区
+    task/{TASK.md, description.txt, src/, poc/, seeds/, scout/}   # 智能体工作区
     out/{result.json, report.md}                  # TriLane 产物
     state/trilane/                                # 该任务独占的 ~/.trilane
     # dind 的 /var/lib/docker 和 socket 用 Docker named volume（trilane-dind-*），任务结束删除
