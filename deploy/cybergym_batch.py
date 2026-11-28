@@ -130,12 +130,19 @@ FORBIDDEN_NAMES = ("error.txt", "patch.diff", "poc", "repo-fix.tar.gz", "repo-fi
 # --crash-hint：从官方 error.txt 派生少量定位信息写进 TASK.md，原文不落盘。
 CRASH_HINT_MODES = ("off", "entry", "full")
 SEED_CORPUS_MODES = ("off", "on")
+FUZZ_DICT_MODES = ("off", "on")
 # pre-agent scout：宿主机 docker 执行，不进入 DinD。
 SCOUT_MODES = ("off", "quick", "boundary", "full")
 SCOUT_LOG_NAME = "scout_log.json"
 SCOUT_MARKDOWN_NAME = "SCOUT_LOG.md"
 SCOUT_BRIEF_BEGIN = "<!-- SCOUT_LOG_BEGIN -->"
 SCOUT_BRIEF_END = "<!-- SCOUT_LOG_END -->"
+# 从源码树/镜像 /out 收集的 libFuzzer 字典；只做格式提示，不参与提交判定。
+DICT_MANIFEST_NAME = "dicts.json"
+DICT_BRIEF_BEGIN = "<!-- FUZZ_DICT_BEGIN -->"
+DICT_BRIEF_END = "<!-- FUZZ_DICT_END -->"
+DICT_MAX_FILES = 8
+DICT_MAX_BYTES = 1 * 1024 * 1024
 SCOUT_CRASH_MARKERS = re.compile(
     r"AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|"
     r"HWAddressSanitizer|runtime error:|stack-overflow|SEGV|SIGSEGV|SIGABRT|ABRT|"
@@ -1838,19 +1845,70 @@ def _scout_boundary(
     return results, _scout_stage_info(results, time.monotonic() - started)
 
 
-def _scout_canonical_fuzzers(task: TaskRef, task_root: Path) -> list[str]:
+def _read_canonical_fuzzers_manifest(task_root: Path) -> list[str]:
     manifest_path = task_root / "task" / "seeds" / "manifest.json"
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        values = payload.get("canonical_fuzzers") or []
-        if isinstance(values, list):
-            return [str(value) for value in values if str(value)]
     except (OSError, json.JSONDecodeError):
-        pass
+        return []
+    values = payload.get("canonical_fuzzers") or []
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if str(value)]
+
+
+def _scout_canonical_fuzzers(task: TaskRef, task_root: Path) -> list[str]:
+    values = _read_canonical_fuzzers_manifest(task_root)
+    if values:
+        return values
     try:
         return _canonical_fuzzers(task, ["docker"])
     except Exception:  # noqa: BLE001 - optional aid
         return []
+
+
+def _scout_available_dict(task_root: Path, fuzzer: str) -> Path | None:
+    """挑一个与 canonical fuzzer 匹配的字典；没有就返回 None。"""
+    seeds_dir = task_root / "task" / "seeds"
+    payload: dict = {}
+    try:
+        payload = json.loads((seeds_dir / DICT_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    if payload.get("fuzz_dict") == "off":
+        return None
+    candidates: list[Path] = []
+    entries = payload.get("dicts") or []
+    if isinstance(entries, list):
+        for item in entries:
+            name = item.get("file") if isinstance(item, dict) else item
+            if not name:
+                continue
+            path = seeds_dir / str(name)
+            if path.is_file() and path.stat().st_size > 0:
+                candidates.append(path)
+    if not candidates:
+        candidates = [
+            path
+            for path in sorted(seeds_dir.glob("*.dict"))
+            if path.is_file() and path.stat().st_size > 0
+        ]
+    if not candidates:
+        return None
+    for path in candidates:
+        if path.stem == fuzzer:
+            return path
+    selected = payload.get("selected")
+    if isinstance(selected, str):
+        path = seeds_dir / selected
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    low = fuzzer.lower()
+    for path in candidates:
+        stem = path.stem.lower()
+        if stem and (stem in low or low.startswith(stem)):
+            return path
+    return candidates[0]
 
 
 def _scout_libfuzzer(
@@ -1905,20 +1963,32 @@ def _scout_libfuzzer(
     )
     if campaign_timeout < 0.5:
         return results, _scout_stage_info(results, time.monotonic() - started, reason="budget_exhausted")
+    # 字典只做格式提示；探测输出里没有 dict flag 的旧版 libFuzzer 就不传。
+    dict_path = _scout_available_dict(task_root, fuzzer)
+    use_dict = (
+        dict_path is not None
+        and re.search(r"(?m)^\s*-?dict\s", probe.output_tail) is not None
+    )
+    mounts: list[tuple[Path, str, str]] = [
+        (corpus_dir, "/corpus", "ro"),
+        (artifacts_dir, "/artifacts", "rw"),
+    ]
+    if use_dict:
+        mounts.append((dict_path, "/dict/fuzz.dict", "ro"))
+    campaign_command = [
+        f"/out/{fuzzer}",
+        f"-max_total_time={int(campaign_timeout)}",
+        "-artifact_prefix=/artifacts/",
+    ]
+    if use_dict:
+        campaign_command.append("-dict=/dict/fuzz.dict")
+    campaign_command.append("/corpus")
     campaign = _scout_run(
         task,
         args,
         stage="libfuzzer",
-        mounts=[
-            (corpus_dir, "/corpus", "ro"),
-            (artifacts_dir, "/artifacts", "rw"),
-        ],
-        command=[
-            f"/out/{fuzzer}",
-            f"-max_total_time={int(campaign_timeout)}",
-            "-artifact_prefix=/artifacts/",
-            "/corpus",
-        ],
+        mounts=mounts,
+        command=campaign_command,
         timeout=min(campaign_timeout + 5, budget.remaining_sec()),
     )
     campaign.name = "libfuzzer-campaign"
@@ -2747,6 +2817,250 @@ def provision_seed_corpora(
     return count
 
 
+def _collect_source_fuzz_dicts(src_dir: Path) -> list[Path]:
+    """列出源码树里的 libFuzzer 字典；只读文件名和大小，不读内容。"""
+    if not src_dir.is_dir():
+        return []
+    found: list[Path] = []
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = sorted(name for name in dirs if name != ".git")
+        for name in sorted(files):
+            if not name.lower().endswith(".dict"):
+                continue
+            path = Path(root) / name
+            try:
+                if path.stat().st_size > DICT_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            found.append(path)
+            if len(found) >= DICT_MAX_FILES * 4:
+                return found
+    return found
+
+
+def _dict_dest_name(path: Path, used: set[str]) -> str:
+    name = _scout_safe_name(path.name)
+    if name not in used:
+        used.add(name)
+        return name
+    parent = _scout_safe_name(path.parent.name)
+    candidate = f"{parent}__{name}"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{parent}__{suffix}__{name}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _pick_fuzz_dict(dicts: list[Path], canonical: list[str]) -> Path | None:
+    """canonical fuzzer 同名优先，其次是名字相近的，最后取第一个。"""
+    if not dicts:
+        return None
+    by_stem: dict[str, Path] = {}
+    for path in dicts:
+        by_stem.setdefault(path.stem.lower(), path)
+    for fuzzer in canonical:
+        match = by_stem.get(fuzzer.lower())
+        if match is not None:
+            return match
+    for fuzzer in canonical:
+        low = fuzzer.lower()
+        for stem, path in by_stem.items():
+            if stem and (stem in low or low.startswith(stem)):
+                return path
+    fuzz_like = [path for path in dicts if "fuzz" in path.parent.as_posix().lower()]
+    if len(fuzz_like) == 1:
+        return fuzz_like[0]
+    return dicts[0]
+
+
+def _copy_out_fuzz_dicts(
+    task: TaskRef,
+    task_dir: Path,
+    seeds_dir: Path,
+    canonical: list[str],
+    docker: list[str],
+) -> None:
+    """把镜像 /out 下的字典拷进 task/seeds；与源码树字典同名时以源码树为准。"""
+    parts = ["mkdir -p /task/seeds"]
+    if canonical:
+        for name in canonical:
+            safe = _scout_safe_name(f"{name}.dict")
+            parts.append(
+                f"[ -e /task/seeds/{safe} ] || cp /out/{name}.dict "
+                f"/task/seeds/{safe} 2>/dev/null || true"
+            )
+    else:
+        parts.append(
+            'for f in /out/*.dict; do [ -e "$f" ] || continue; '
+            'b=$(basename "$f"); [ -e "/task/seeds/$b" ] || '
+            'cp "$f" "/task/seeds/$b" 2>/dev/null || true; done'
+        )
+    parts.append("exit 0")
+    cmd = docker + [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--label",
+        f"trilane.task={task.slug}",
+        "--entrypoint",
+        "/bin/sh",
+        "-v",
+        f"{daemon_path(task_dir)}:/task",
+        task.vul_image,
+        "-c",
+        "; ".join(parts),
+    ]
+    try:
+        proc = run(cmd, timeout=120)
+    except Exception as exc:  # noqa: BLE001 - 字典是可选增益
+        log(f"[{task.task_id}] /out 字典提取异常（继续运行）：{exc}")
+        return
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[-300:]
+        log(f"[{task.task_id}] /out 字典提取失败（继续运行）：{detail}")
+
+
+def _append_fuzz_dict_brief(task_root: Path, payload: dict) -> None:
+    selected = payload.get("selected")
+    if not isinstance(selected, str) or not selected:
+        return
+    seeds_dir = task_root / "task" / "seeds"
+    if not (seeds_dir / selected).is_file():
+        return
+    task_md = task_root / "task" / "TASK.md"
+    try:
+        text = task_md.read_text(encoding="utf-8")
+    except OSError:
+        return
+    text = re.sub(
+        re.escape(DICT_BRIEF_BEGIN) + r".*?" + re.escape(DICT_BRIEF_END) + r"\n?",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    where = (
+        "the pre-patch source tree"
+        if payload.get("selected_origin") == "src"
+        else "the vulnerable image"
+    )
+    block = "\n".join(
+        [
+            DICT_BRIEF_BEGIN,
+            "## Fuzzer dictionary",
+            "",
+            f"A libFuzzer dictionary from {where} is available at `seeds/{selected}`.",
+            "It is format vocabulary only, not a reference PoC. When you fuzz locally, use it:",
+            "",
+            f"- libFuzzer: `-dict=seeds/{selected}`",
+            f"- AFL++: `-x seeds/{selected}`",
+            "",
+            "The final candidate still has to be verified through the vulnerable image.",
+            DICT_BRIEF_END,
+            "",
+        ]
+    )
+    if text and not text.endswith("\n"):
+        text += "\n"
+    task_md.write_text(text + block, encoding="utf-8")
+
+
+def provision_fuzz_dicts(
+    task: TaskRef,
+    task_root: Path,
+    args: argparse.Namespace,
+    dind: DindHandle | None = None,
+) -> list[str]:
+    """把可用的 libFuzzer 字典放进 task/seeds，供 scout 和 agent 复用。
+
+    源码树里的 `*.dict` 属于 level1 材料，始终收集；镜像 `/out/*.dict` 属于运行时
+    产物，只在 `SEED_CORPUS=on` 时收集。失败只记录，不阻断任务。
+    """
+    mode = str(getattr(args, "fuzz_dict", "on") or "on")
+    if mode not in FUZZ_DICT_MODES or mode == "off":
+        return []
+    task_dir = task_root / "task"
+    seeds_dir = task_dir / "seeds"
+    try:
+        safe_mkdir(seeds_dir)
+    except Exception as exc:  # noqa: BLE001 - 可选增益
+        log(f"[{task.task_id}] 字典目录准备异常（继续运行）：{exc}")
+        return []
+    canonical = _read_canonical_fuzzers_manifest(task_root)
+    docker = ["docker", "exec", dind.name, "docker"] if dind is not None else ["docker"]
+    if not canonical:
+        try:
+            canonical = _canonical_fuzzers(task, docker)
+        except Exception:  # noqa: BLE001
+            canonical = []
+
+    used: set[str] = set()
+    source_names: dict[str, str] = {}
+    for path in _collect_source_fuzz_dicts(task_dir / "src"):
+        dest_name = _dict_dest_name(path, used)
+        try:
+            shutil.copyfile(path, seeds_dir / dest_name)
+        except OSError as exc:
+            log(f"[{task.task_id}] 复制源码字典失败 {path.name}: {exc}")
+            continue
+        try:
+            source_names[dest_name] = path.relative_to(task_dir).as_posix()
+        except ValueError:
+            source_names[dest_name] = path.name
+
+    if getattr(args, "seed_corpus", "on") == "on":
+        _copy_out_fuzz_dicts(task, task_dir, seeds_dir, canonical, docker)
+
+    entries: list[dict] = []
+    for path in sorted(seeds_dir.glob("*.dict"))[: DICT_MAX_FILES * 2]:
+        try:
+            if not path.is_file() or path.stat().st_size > DICT_MAX_BYTES:
+                continue
+        except OSError:
+            continue
+        if path.name in source_names:
+            entries.append(
+                {"file": path.name, "origin": "src", "source_path": source_names[path.name]}
+            )
+        else:
+            entries.append(
+                {"file": path.name, "origin": "out", "source_path": f"/out/{path.name}"}
+            )
+    if not entries:
+        return []
+
+    src_paths = [seeds_dir / item["file"] for item in entries if item["origin"] == "src"]
+    selected = _pick_fuzz_dict(src_paths, canonical)
+    if selected is None:
+        selected = _pick_fuzz_dict([seeds_dir / item["file"] for item in entries], canonical)
+    if selected is None:
+        return []
+    selected_origin = "src" if selected.name in source_names else "out"
+    payload = {
+        "canonical_fuzzers": canonical,
+        "selected": selected.name,
+        "selected_origin": selected_origin,
+        "dicts": entries,
+        "seed_corpus": getattr(args, "seed_corpus", "on"),
+        "fuzz_dict": mode,
+    }
+    try:
+        (seeds_dir / DICT_MANIFEST_NAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        log(f"[{task.task_id}] 写入字典清单失败（继续运行）：{exc}")
+    _append_fuzz_dict_brief(task_root, payload)
+    log(
+        f"[{task.task_id}] 已准备 {len(entries)} 个 fuzz 字典，选中 {selected.name}"
+        f"（{selected_origin}）-> {seeds_dir}"
+    )
+    return [item["file"] for item in entries]
+
+
 def run_agent_in_dind(
     handle: DindHandle,
     *,
@@ -2875,6 +3189,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                     )
                 log(f"[{task.task_id}] DinD 就绪")
                 provision_seed_corpora(task, task_root, args, dind)
+                provision_fuzz_dicts(task, task_root, args, dind)
             except Exception as exc:
                 return RunOutcome(
                     "container_failed",
@@ -2911,6 +3226,7 @@ def run_agent(task: TaskRef, task_root: Path, args: argparse.Namespace) -> RunOu
                 if blocked is not None:
                     return blocked
             provision_seed_corpora(task, task_root, args)
+            provision_fuzz_dicts(task, task_root, args)
             scout_summary = _run_scouts_safe(task, task_root, args)
             agent_started = time.monotonic()
             cmd = [
@@ -4568,6 +4884,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="on",
         help="是否允许使用目标镜像 /out 下的种子语料：on=允许（默认，动态分析），"
         "off=不允许（严格 level 1）",
+    )
+    parser.add_argument(
+        "--fuzz-dict",
+        choices=FUZZ_DICT_MODES,
+        default=os.environ.get("FUZZ_DICT", "on"),
+        help="是否收集并使用 libFuzzer 字典：on=收集源码树 *.dict（SEED_CORPUS=on 时还收集 /out *.dict）；"
+        "off=不收集、不给 scout 传 -dict（A/B 对照用）",
     )
     parser.add_argument(
         "--scout-mode",
