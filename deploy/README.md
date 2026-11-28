@@ -36,8 +36,7 @@
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `trilane-batch-runner.tgz` | 71MB | 编排器 1.0.24，内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
-| `trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
+| `trilane-batch-runner-1.0.29-lf.tar.gz` | 70MB | 编排器 1.0.29（LF 换行版，Linux 上 `sha256sum` 自检可直接对齐），内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
 | `SHA256SUMS` | — | 校验和，服务器上 `sha256sum -c` 验一遍 |
 
 `trilane-headless:1.0.8` 的 Rust 二进制在 WSL（Ubuntu 24.04）里编译后 COPY 进 runtime-only 镜像，
@@ -62,7 +61,7 @@
 
 ### 新服务器（镜像包已在本目录）
 
-`deploy/images/` 里已经有编排器和智能体两个镜像包，直接导入即可
+`deploy/images/` 里是编排器镜像包，直接导入即可
 （`.tgz` 与 `.tar.gz` 都是 gzip 压缩的 tar，新导出统一用 `.tar.gz`，这里两种都收）：
 
 ```bash
@@ -78,10 +77,11 @@ for f in images/*.tgz images/*.tar.gz; do gunzip -c "$f" | docker load; done
 
 | 包 | 大小 | 内容 |
 | --- | --- | --- |
-| `images/trilane-batch-runner.tgz` | 71MB | 编排器（1.0.24），内含 `cybergym_batch.py` + `triage.py` |
-| `images/trilane-batch-runner-1.0.24.tgz` | 71MB | 同上，带版本号的副本 |
-| `images/trilane-headless-1.0.8.tar.gz` | 298MB | 智能体本体 |
-| `images/SHA256SUMS` | — | 上面几个包的校验和 |
+| `images/trilane-batch-runner-1.0.29-lf.tar.gz` | 70MB | 编排器 1.0.29（LF 换行版），内含 `cybergym_batch.py` + `triage.py` + `triage.sh` |
+| `images/SHA256SUMS` | — | 上面镜像包的校验和 |
+
+本目录当前只有编排器包；智能体镜像 `trilane-headless` 需要从打包机另行导出/导入（见 §5.2），
+目标镜像同理。
 
 目标镜像（`n132/arvo:<id>-vul`）要另外从打包机带过来，见下。
 
@@ -131,11 +131,15 @@ cp /opt/cybergym/mask_map.json /opt/
 > 动态分析模式（`SEED_CORPUS=on`，默认）会在起智能体前从 vul 镜像的 `/out` 复制
 > `*_seed_corpus.zip` 到 `task/seeds/`，不复制预构建 fuzz 二进制；设 `SEED_CORPUS=off`
 > 可回到严格 level 1。
+>
+> fuzz 字典单独处理：源码树里的 `*.dict`（level1 材料）始终收集到 `task/seeds/`，
+> 镜像 `/out/*.dict` 只在 `SEED_CORPUS=on` 时收集；选中项写入 `seeds/dicts.json`，
+> scout 的 libFuzzer campaign 会带 `-dict=`，TASK.md 也会提示 agent 用 `-dict=` / `-x`。
 
 验证镜像：
 
 ```bash
-docker run --rm trilane-batch-runner:1.0.24 --help >/dev/null && echo runner-ok
+docker run --rm trilane-batch-runner:1.0.29-lf --help >/dev/null && echo runner-ok
 
 docker run --rm trilane-headless --headless
 # 期望：trilane headless: --headless requires --objective-file <path>
@@ -241,7 +245,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ```bash
 cd deploy
-docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.24 .
+docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.29-lf .
 ```
 
 构建上下文只有 `deploy/`，不会把整个仓库塞进去。走代理时：
@@ -250,13 +254,13 @@ docker build -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.24 .
 docker build \
   --build-arg HTTP_PROXY=http://<proxy>:<port> \
   --build-arg HTTPS_PROXY=http://<proxy>:<port> \
-  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.24 .
+  -f batch-runner.Dockerfile -t trilane-batch-runner:1.0.29-lf .
 ```
 
 确认镜像里的脚本和本地一致（改了脚本却忘了重建时，这条能立刻发现）：
 
 ```bash
-docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.24 \
+docker run --rm --entrypoint /bin/sh trilane-batch-runner:1.0.29-lf \
   -c 'sha256sum /opt/trilane-batch/cybergym_batch.py'
 sha256sum cybergym_batch.py        # 两个值必须相同
 ```
@@ -396,7 +400,7 @@ docker run --rm \
   -v "$PWD/tasks:/tasklist:ro" \
   -v /var/lib/trilane:/var/lib/trilane \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.24 \
+  trilane-batch-runner:1.0.29-lf \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -414,7 +418,7 @@ docker run -d --name trilane-batch-1 \
   # 镜像盘检查：宿主机 docker 数据目录（同路径只读挂载）；不配则退回 dind 内 df
   -v /var/lib/docker:/var/lib/docker:ro \
   --add-host host.docker.internal:host-gateway \
-  trilane-batch-runner:1.0.24 \
+  trilane-batch-runner:1.0.29-lf \
     --task-file /tasklist/tasks.txt \
     --data-dir /opt/cybergym_data \
     --mask-map /opt/mask_map.json \
@@ -477,7 +481,7 @@ runner 起的 dind 是**兄弟容器**（sibling），智能体又跑在 dind �
 | `--agent-retries` | 1 | 智能体因 OOM/启动失败中断时批内自动重试次数 |
 | `--max-submits` | 3 | 最多试几个候选；最终只报 1 个答案 |
 | `--verify-rounds` | 3 | 每个候选重复提交几轮取多数票 |
-| `--seed-corpus` | on | 是否允许使用目标镜像 `/out` 下的种子语料；off=严格 level 1 |
+| `--seed-corpus` | on | 是否允许使用目标镜像 `/out` 下的种子语料和 fuzz 字典；off=严格 level 1（源码树 `.dict` 仍然可用） |
 | `--scout-mode` | off | pre-agent scout：off / quick / boundary / full；固定走宿主机 docker，不占 agent 超时 |
 | `--scout-timeout-sec` | 180 | scout 阶段独立墙钟上限，不从 `--timeout-sec` 扣减 |
 | `--scout-max-runs` | 40 | 整个任务最多执行多少个 scout 候选 |
@@ -614,7 +618,7 @@ docker run --rm --entrypoint python3 \
 
 | # | 检查 | 命令 | 期望 |
 | --- | --- | --- | --- |
-| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.24 --help` | 打印用法 |
+| 1 | 编排器镜像 | `docker run --rm trilane-batch-runner:1.0.29-lf --help` | 打印用法 |
 | 2 | 智能体镜像 | `docker run --rm trilane-headless --headless` | 提示缺 `--objective-file` |
 | 3 | 目标镜像齐 | `docker images \| grep -c -- '-vul'` | ≥ 任务数 |
 | 4 | 服务端（宿主） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8666/docs` | `200` |

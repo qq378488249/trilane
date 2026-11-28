@@ -58,6 +58,7 @@ x-batch-common: &batch-common
     POC_SCAN_MAX_FILES: ${POC_SCAN_MAX_FILES:-500}
     POC_SCAN_MAX_MB: ${POC_SCAN_MAX_MB:-20}
     # pre-agent scout（宿主机 docker）
+    FUZZ_DICT: ${FUZZ_DICT:-on}
     SCOUT_MODE: ${SCOUT_MODE:-on}
     SCOUT_TIMEOUT_SEC: ${SCOUT_TIMEOUT_SEC:-420}
     SCOUT_RUN_TIMEOUT_SEC: ${SCOUT_RUN_TIMEOUT_SEC:-10}
@@ -123,6 +124,9 @@ x-batch-args: &batch-args
   # 是否允许使用目标镜像 /out 下的种子语料；on=允许（默认，动态分析），off=严格 level 1
   - --seed-corpus
   - ${SEED_CORPUS:-on}
+  # fuzz 字典：on=收集 *.dict 并给 scout 传 -dict；off=A/B 对照
+  - --fuzz-dict
+  - ${FUZZ_DICT:-on}
   # pre-agent scout：off / quick / boundary / full（宿主机 docker，独立超时）
   - --scout-mode
   - ${SCOUT_MODE:-off}
